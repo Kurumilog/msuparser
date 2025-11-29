@@ -170,12 +170,24 @@ func (bot *TimetableBot) FormatNotification(lesson *Lesson) string {
 }
 
 func ParseTime(dateStr, timeStr string) (time.Time, error) {
+	// Парсим дату/время в часовом поясе Минска (Europe/Minsk)
+	loc, err := time.LoadLocation("Europe/Minsk")
+	if err != nil {
+		// fallback на локальную зону
+		loc = time.Local
+	}
+
 	dateTimeStr := fmt.Sprintf("%s %s", dateStr, timeStr)
-	return time.Parse("02.01.2006 15:04", dateTimeStr)
+	return time.ParseInLocation("02.01.2006 15:04", dateTimeStr, loc)
 }
 
 func (bot *TimetableBot) GetUpcomingLessons() []Lesson {
-	now := time.Now()
+	// Используем время в часовом поясе Минска
+	loc, err := time.LoadLocation("Europe/Minsk")
+	if err != nil {
+		loc = time.Local
+	}
+	now := time.Now().In(loc)
 	upcoming := []Lesson{}
 
 	for _, lesson := range bot.schedule {
@@ -188,7 +200,8 @@ func (bot *TimetableBot) GetUpcomingLessons() []Lesson {
 		notificationTime = notificationTime.Add(-time.Duration(NotificationMinutes) * time.Minute)
 
 		// Проверяем что пара в будущем
-		if now.Before(notificationTime) {
+		// Сравниваем во временной зоне Минска
+		if now.Before(notificationTime.In(loc)) {
 			lesson.Notification = notificationTime
 			upcoming = append(upcoming, lesson)
 		}
