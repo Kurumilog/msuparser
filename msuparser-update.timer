@@ -1,0 +1,11 @@
+[Unit]
+Description=MSU Parser Schedule Update Timer (every 3 days)
+Requires=msuparser-update.service
+
+[Timer]
+OnBootSec=5min
+OnUnitActiveSec=3d
+Persistent=true
+
+[Install]
+WantedBy=timers.target

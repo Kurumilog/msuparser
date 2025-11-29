@@ -1,0 +1,70 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+ENV/
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# Go
+main
+*.exe
+*.dll
+*.so
+*.dylib
+*.test
+*.out
+/bin/
+/pkg/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Config files with sensitive data
+config.py
+config.json
+config.go
+
+# Process IDs
+.pids
+
+# Webdriver
+.wdm/
+
+# Schedule files (will be regenerated)
+schedule.json
+
+# Logs
+*.log
+logs/
+
+# Environment
+.env
+.env.local
+
+# OS
+Thumbs.db
+.DS_Store

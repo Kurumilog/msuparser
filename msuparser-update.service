@@ -1,0 +1,15 @@
+[Unit]
+Description=MSU Parser Schedule Update Service
+After=network.target
+
+[Service]
+Type=oneshot
+User=%u
+WorkingDirectory=%h/code/projects/duo/msuparser
+ExecStart=%h/code/projects/duo/msuparser/update_schedule.sh
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=msuparser
+
+[Install]
+WantedBy=default.target

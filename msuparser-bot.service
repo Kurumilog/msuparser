@@ -1,0 +1,18 @@
+[Unit]
+Description=MSU Timetable Bot (Go)
+After=network.target msuparser-update.service
+Wants=msuparser-update.timer
+
+[Service]
+Type=simple
+User=%u
+WorkingDirectory=%h/code/projects/duo/msuparser
+ExecStart=%h/code/projects/duo/msuparser/bot
+Restart=always
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=msuparser-bot
+
+[Install]
+WantedBy=default.target
