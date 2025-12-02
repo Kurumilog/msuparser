@@ -196,8 +196,12 @@ func (bot *TimetableBot) GetUpcomingLessons() []Lesson {
 			continue
 		}
 
-		// Вычитаем 15 минут
-		notificationTime = notificationTime.Add(-time.Duration(NotificationMinutes) * time.Minute)
+		// Устанавливаем время уведомления
+		minutesToSubtract := NotificationMinutes
+		if lesson.LessonNumber == "3" {
+			minutesToSubtract = 45
+		}
+		notificationTime = notificationTime.Add(-time.Duration(minutesToSubtract) * time.Minute)
 
 		// Проверяем что пара в будущем
 		// Сравниваем во временной зоне Минска
