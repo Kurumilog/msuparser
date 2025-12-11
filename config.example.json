@@ -1,0 +1,5 @@
+{
+  "BOT_TOKEN": "your-telegram-bot-token-here",
+  "USER_ID": "your-telegram-user-id-here",
+  "NOTIFICATION_MINUTES": 15
+}

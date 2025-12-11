@@ -1,15 +1,15 @@
 [Unit]
-Description=MSU Parser Schedule Update Service
+Description=MSU Parser Schedule Update Service (Go)
 After=network.target
 
 [Service]
 Type=oneshot
-User=%u
-WorkingDirectory=%h/code/projects/duo/msuparser
-ExecStart=%h/code/projects/duo/msuparser/update_schedule.sh
+User=ubuntu
+WorkingDirectory=/home/ubuntu/msuparser
+ExecStart=/home/ubuntu/msuparser/test_parser
 StandardOutput=journal
 StandardError=journal
-SyslogIdentifier=msuparser
+SyslogIdentifier=msuparser-update
 
 [Install]
 WantedBy=default.target

@@ -25,19 +25,6 @@ var (
 	NotificationMinutes int
 )
 
-type Lesson struct {
-	Subject      string    `json:"subject"`
-	Teacher      string    `json:"teacher"`
-	Room         string    `json:"room"`
-	LessonNumber string    `json:"lesson_number"`
-	TimeStart    string    `json:"time_start"`
-	TimeEnd      string    `json:"time_end"`
-	Date         string    `json:"date"`
-	Weekday      string    `json:"weekday"`
-	Group        string    `json:"group"`
-	Notification time.Time `json:"-"`
-}
-
 type Config struct {
 	BotToken            string `json:"BOT_TOKEN"`
 	UserID              string `json:"USER_ID"`
@@ -45,11 +32,12 @@ type Config struct {
 }
 
 type TimetableBot struct {
-	botToken          string
-	userID            string
-	schedule          []Lesson
-	sentNotifications map[string]bool
-	lastUpdateID      int
+	botToken                  string
+	userID                    string
+	schedule                  []Lesson
+	sentNotifications         map[string]bool
+	sentDistanceNotifications map[string]bool // Трекинг дистанционных уведомлений по дате
+	lastUpdateID              int
 }
 
 type Update struct {
@@ -99,11 +87,12 @@ func LoadConfig() (Config, error) {
 
 func NewTimetableBot(token, userID string) *TimetableBot {
 	return &TimetableBot{
-		botToken:          token,
-		userID:            userID,
-		schedule:          []Lesson{},
-		sentNotifications: make(map[string]bool),
-		lastUpdateID:      0,
+		botToken:                  token,
+		userID:                    userID,
+		schedule:                  []Lesson{},
+		sentNotifications:         make(map[string]bool),
+		sentDistanceNotifications: make(map[string]bool),
+		lastUpdateID:              0,
 	}
 }
 
@@ -125,6 +114,26 @@ func (bot *TimetableBot) LoadSchedule(filename string) error {
 
 	fmt.Printf("✅ Загружено %d пар\n", len(bot.schedule))
 	return nil
+}
+
+func (bot *TimetableBot) UpdateSchedule() {
+	// Запускаем парсер для обновления расписания
+	cmd := exec.Command("./test_parser")
+	cmd.Dir = "."
+
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		fmt.Printf("❌ Ошибка запуска парсера: %v\n", err)
+		fmt.Printf("Вывод: %s\n", string(output))
+		return
+	}
+
+	// Перезагружаем расписание из обновленного файла
+	err = bot.LoadSchedule("schedule.json")
+	if err != nil {
+		fmt.Printf("❌ Ошибка перезагрузки расписания: %v\n", err)
+		return
+	}
 }
 
 func (bot *TimetableBot) SendMessage(message string) error {
@@ -170,8 +179,8 @@ func (bot *TimetableBot) FormatNotification(lesson *Lesson) string {
 }
 
 func ParseTime(dateStr, timeStr string) (time.Time, error) {
-	// Парсим дату/время в часовом поясе Минска (Europe/Minsk)
-	loc, err := time.LoadLocation("Europe/Minsk")
+	// Парсим дату/время в московском часовом поясе (Europe/Moscow)
+	loc, err := time.LoadLocation("Europe/Moscow")
 	if err != nil {
 		// fallback на локальную зону
 		loc = time.Local
@@ -182,8 +191,8 @@ func ParseTime(dateStr, timeStr string) (time.Time, error) {
 }
 
 func (bot *TimetableBot) GetUpcomingLessons() []Lesson {
-	// Используем время в часовом поясе Минска
-	loc, err := time.LoadLocation("Europe/Minsk")
+	// Используем московское время (Europe/Moscow)
+	loc, err := time.LoadLocation("Europe/Moscow")
 	if err != nil {
 		loc = time.Local
 	}
@@ -197,6 +206,8 @@ func (bot *TimetableBot) GetUpcomingLessons() []Lesson {
 		}
 
 		// Устанавливаем время уведомления
+		// Для 3 пары - за 45 минут (в 12:15 если пара в 13:00)
+		// Для остальных - за 15 минут
 		minutesToSubtract := NotificationMinutes
 		if lesson.LessonNumber == "3" {
 			minutesToSubtract = 45
@@ -214,11 +225,99 @@ func (bot *TimetableBot) GetUpcomingLessons() []Lesson {
 	return upcoming
 }
 
+// isDistanceLearning проверяет является ли пара дистанционной
+func isDistanceLearning(room string) bool {
+	room = strings.ToLower(strings.TrimSpace(room))
+	return strings.Contains(room, "дистанц") || strings.Contains(room, "виртуал")
+}
+
+// SendDistanceLearningNotification отправляет уведомление о дистанционных парах за день
+func (bot *TimetableBot) SendDistanceLearningNotification(date string, lessons []Lesson) {
+	if bot.sentDistanceNotifications[date] {
+		return
+	}
+
+	message := fmt.Sprintf(
+		"📱 <b>Утреннее напоминание</b>\n\n" +
+			"У вас сегодня дистанционные пары:\n\n",
+	)
+
+	for _, lesson := range lessons {
+		message += fmt.Sprintf(
+			"• %s пара (%s-%s)\n  📚 %s\n",
+			lesson.LessonNumber,
+			lesson.TimeStart,
+			lesson.TimeEnd,
+			lesson.Subject,
+		)
+		if lesson.Teacher != "" {
+			message += fmt.Sprintf("  👨‍🏫 %s\n", lesson.Teacher)
+		}
+	}
+
+	err := bot.SendMessage(message)
+	if err == nil {
+		fmt.Printf("✅ Отправлено уведомление о дистанционных парах на %s\n", date)
+		bot.sentDistanceNotifications[date] = true
+	}
+}
+
+// GetTodayDistanceLessons возвращает все дистанционные пары на сегодня
+func (bot *TimetableBot) GetTodayDistanceLessons() map[string][]Lesson {
+	loc, _ := time.LoadLocation("Europe/Moscow")
+	now := time.Now().In(loc)
+	today := now.Format("02.01.2006")
+
+	distanceLessons := make(map[string][]Lesson)
+
+	for _, lesson := range bot.schedule {
+		if lesson.Date == today && isDistanceLearning(lesson.Room) {
+			distanceLessons[lesson.Date] = append(distanceLessons[lesson.Date], lesson)
+		}
+	}
+
+	return distanceLessons
+}
+
+// HasInPersonLessonsToday проверяет есть ли очные пары сегодня
+func (bot *TimetableBot) HasInPersonLessonsToday() bool {
+	loc, _ := time.LoadLocation("Europe/Moscow")
+	now := time.Now().In(loc)
+	today := now.Format("02.01.2006")
+
+	for _, lesson := range bot.schedule {
+		if lesson.Date == today && !isDistanceLearning(lesson.Room) {
+			return true
+		}
+	}
+	return false
+}
+
 func (bot *TimetableBot) CheckAndSendNotifications() {
 	now := time.Now()
 	upcoming := bot.GetUpcomingLessons()
 
+	// Проверяем: если ВСЕ пары дистанционные (нет очных) - отправляем утреннее уведомление в 8:00
+	loc, _ := time.LoadLocation("Europe/Moscow")
+	nowInMoscow := now.In(loc)
+	if nowInMoscow.Hour() == 8 && nowInMoscow.Minute() == 0 {
+		// Отправляем утреннее уведомление только если нет очных пар
+		if !bot.HasInPersonLessonsToday() {
+			distanceLessons := bot.GetTodayDistanceLessons()
+			for date, lessons := range distanceLessons {
+				bot.SendDistanceLearningNotification(date, lessons)
+			}
+		}
+	}
+
+	// Отправляем обычные уведомления за 30 минут
 	for _, lesson := range upcoming {
+		// Если есть очные пары сегодня - отправляем уведомления для ВСЕХ пар (включая дистанционные)
+		// Если НЕТ очных пар - пропускаем дистанционные (они уже получили утреннее уведомление)
+		if !bot.HasInPersonLessonsToday() && isDistanceLearning(lesson.Room) {
+			continue
+		}
+
 		lessonKey := fmt.Sprintf("%s_%s_%s", lesson.Date, lesson.LessonNumber, lesson.Subject)
 
 		if bot.sentNotifications[lessonKey] {
@@ -263,9 +362,26 @@ func (bot *TimetableBot) RunScheduler() {
 		}
 	}()
 
+	// Переменная для отслеживания последнего запуска парсера
+	lastParserRun := time.Now().Add(-25 * time.Hour) // Инициализируем в прошлом
+
 	for {
 		select {
 		case <-ticker.C:
+			// Проверяем нужно ли запустить парсер (каждый день в 2:00)
+			loc, _ := time.LoadLocation("Europe/Moscow")
+			nowMoscow := time.Now().In(loc)
+
+			// Если сейчас 2:00 и парсер не запускался сегодня
+			if nowMoscow.Hour() == 2 && nowMoscow.Minute() == 0 {
+				if time.Since(lastParserRun) > 23*time.Hour {
+					fmt.Println("\n🔄 Запуск парсера для обновления расписания...")
+					bot.UpdateSchedule()
+					lastParserRun = time.Now()
+					fmt.Println("✅ Расписание обновлено\n")
+				}
+			}
+
 			bot.CheckAndSendNotifications()
 		case <-sigChan:
 			fmt.Println("\n\n⏹️  Бот остановлен")

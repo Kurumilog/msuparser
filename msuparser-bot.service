@@ -5,9 +5,9 @@ Wants=msuparser-update.timer
 
 [Service]
 Type=simple
-User=%u
-WorkingDirectory=%h/code/projects/duo/msuparser
-ExecStart=%h/code/projects/duo/msuparser/bot
+User=ubuntu
+WorkingDirectory=/home/ubuntu/msuparser
+ExecStart=/home/ubuntu/msuparser/main
 Restart=always
 RestartSec=10
 StandardOutput=journal
