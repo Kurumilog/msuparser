@@ -443,12 +443,15 @@ func (bot *TimetableBot) PollUpdates() {
 }
 
 func (bot *TimetableBot) HandleUpdate(update Update) {
+	// Логируем входящее сообщение
+	fmt.Printf("📩 Получено сообщение от %d: %s\n", update.Message.Chat.ID, update.Message.Text)
+
 	if update.Message.Text == "/start" {
 		welcomeMsg := "👋 Привет! Я бот расписания МГУ ВШГА.\n\n" +
 			"Я буду присылать уведомления за 15 минут до начала пар.\n" +
-			"Расписание обновляется автоматически раз в 3 дня.\n\n" +
+			"Расписание обновляется автоматически каждый день в 2:00.\n\n" +
 			"Твой ID: " + fmt.Sprintf("%d", update.Message.Chat.ID) + "\n" +
-			"(Убедись, что этот ID прописан в config.py)"
+			"(Убедись, что этот ID прописан в config.json)"
 
 		bot.SendMessageToChat(update.Message.Chat.ID, welcomeMsg)
 	}
