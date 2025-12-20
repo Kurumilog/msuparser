@@ -159,6 +159,14 @@ func (bot *TimetableBot) SendMessage(message string) error {
 	return nil
 }
 
+// escapeHTML экранирует специальные HTML символы для Telegram API
+func escapeHTML(text string) string {
+	text = strings.ReplaceAll(text, "&", "&amp;")
+	text = strings.ReplaceAll(text, "<", "&lt;")
+	text = strings.ReplaceAll(text, ">", "&gt;")
+	return text
+}
+
 func (bot *TimetableBot) FormatNotification(lesson *Lesson) string {
 	message := fmt.Sprintf(
 		"🔔 <b>Скоро пара!</b>\n\n"+
@@ -167,9 +175,9 @@ func (bot *TimetableBot) FormatNotification(lesson *Lesson) string {
 			"🚪 <b>Аудитория:</b> %s\n\n"+
 			"🕐 <b>Время:</b> %s - %s\n"+
 			"📅 <b>Дата:</b> %s (%s)",
-		lesson.Subject,
-		lesson.Teacher,
-		lesson.Room,
+		escapeHTML(lesson.Subject),
+		escapeHTML(lesson.Teacher),
+		escapeHTML(lesson.Room),
 		lesson.TimeStart,
 		lesson.TimeEnd,
 		lesson.Date,
@@ -248,10 +256,10 @@ func (bot *TimetableBot) SendDistanceLearningNotification(date string, lessons [
 			lesson.LessonNumber,
 			lesson.TimeStart,
 			lesson.TimeEnd,
-			lesson.Subject,
+			escapeHTML(lesson.Subject),
 		)
 		if lesson.Teacher != "" {
-			message += fmt.Sprintf("  👨‍🏫 %s\n", lesson.Teacher)
+			message += fmt.Sprintf("  👨‍🏫 %s\n", escapeHTML(lesson.Teacher))
 		}
 	}
 
