@@ -152,8 +152,13 @@ func (bot *TimetableBot) SendMessage(message string) error {
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
+		bodyBytes, _ := ioutil.ReadAll(resp.Body)
+		bodyString := string(bodyBytes)
 		fmt.Printf("❌ Ошибка Telegram API: статус %d\n", resp.StatusCode)
-		return fmt.Errorf("telegram error: %d", resp.StatusCode)
+		fmt.Printf("📝 Ответ сервера: %s\n", bodyString)
+		fmt.Printf("📤 Отправляемое сообщение: %s\n", message)
+		fmt.Printf("🆔 Chat ID: %s\n", UserID)
+		return fmt.Errorf("telegram error: %d: %s", resp.StatusCode, bodyString)
 	}
 
 	return nil
