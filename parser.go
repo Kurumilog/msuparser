@@ -157,9 +157,21 @@ func parseLessonData(dataContent string) (name, lessonType, room, teacher string
 		parts[i] = strings.TrimSpace(part)
 	}
 
-	// Index 0: Название предмета и тип занятия
-	if len(parts) > 0 {
-		firstPart := parts[0]
+	if len(parts) == 0 {
+		return
+	}
+
+	startIndex := 0
+	// Проверяем, является ли первая часть временем (например "12:30-14:00")
+	// Если да, то сдвигаем индексы
+	isTimeRange := regexp.MustCompile(`^\d{1,2}:\d{2}\s*-\s*\d{1,2}:\d{2}`).MatchString(parts[0])
+	if isTimeRange {
+		startIndex = 1
+	}
+
+	// Index 0 (или 1): Название предмета и тип занятия
+	if len(parts) > startIndex {
+		firstPart := parts[startIndex]
 		// Ищем тип занятия в квадратных скобках
 		re := regexp.MustCompile(`^(.+?)\[(.+?)\]`)
 		matches := re.FindStringSubmatch(firstPart)
@@ -171,18 +183,18 @@ func parseLessonData(dataContent string) (name, lessonType, room, teacher string
 		}
 	}
 
-	// Index 1: Аудитория (удаляем префикс "ауд.")
-	if len(parts) > 1 {
-		room = strings.TrimSpace(parts[1])
+	// Index 1 (или 2): Аудитория (удаляем префикс "ауд.")
+	if len(parts) > startIndex+1 {
+		room = strings.TrimSpace(parts[startIndex+1])
 		room = strings.TrimPrefix(room, "ауд.")
 		room = strings.TrimSpace(room)
 	}
 
 	// Ищем преподавателя - он не содержит "Добавлено:", "ауд.", цифры группы
-	for i := 2; i < len(parts); i++ {
+	for i := startIndex + 2; i < len(parts); i++ {
 		part := strings.TrimSpace(parts[i])
-		// Пропускаем пустые, "Добавлено:", номера групп (только цифры)
-		if part == "" || strings.HasPrefix(part, "Добавлено:") {
+		// Пропускаем пустые, "Добавлено:", "ауд.", номера групп (только цифры)
+		if part == "" || strings.HasPrefix(part, "Добавлено:") || strings.HasPrefix(part, "ауд.") {
 			continue
 		}
 		// Пропускаем если это только цифры (номер группы)
