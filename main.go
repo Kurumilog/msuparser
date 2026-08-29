@@ -1,14 +1,20 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
+	"io"
 	"io/ioutil"
+	"math/rand"
+	"mime/multipart"
 	"net/http"
 	"net/url"
 	"os"
 	"os/exec"
 	"os/signal"
+	"path/filepath"
+	"sort"
 	"strings"
 	"syscall"
 	"time"
@@ -17,6 +23,11 @@ import (
 const (
 	CheckInterval  = 1 * time.Minute
 	TelegramAPIURL = "https://api.telegram.org/bot"
+	AppVersion     = "smart-summary-2026-04-29-2"
+
+	RegularGifDir = "assets/gif/regular"
+	MorningGifDir = "assets/gif/gm"
+	EveningGifDir = "assets/gif/evening"
 )
 
 var (
@@ -37,21 +48,45 @@ type TimetableBot struct {
 	schedule                  []Lesson
 	sentNotifications         map[string]bool
 	sentDistanceNotifications map[string]bool // Трекинг дистанционных уведомлений по дате
+	sentDailyGreetings        map[string]bool
+	lastScheduleMessages      map[int64][]int
 	lastUpdateID              int
 }
 
 type Update struct {
-	UpdateID int     `json:"update_id"`
-	Message  Message `json:"message"`
+	UpdateID      int            `json:"update_id"`
+	Message       *Message       `json:"message,omitempty"`
+	CallbackQuery *CallbackQuery `json:"callback_query,omitempty"`
 }
 
 type Message struct {
-	Chat Chat   `json:"chat"`
-	Text string `json:"text"`
+	MessageID int    `json:"message_id"`
+	Chat      Chat   `json:"chat"`
+	Text      string `json:"text"`
 }
 
 type Chat struct {
 	ID int64 `json:"id"`
+}
+
+type CallbackQuery struct {
+	ID      string   `json:"id"`
+	From    User     `json:"from"`
+	Message *Message `json:"message,omitempty"`
+	Data    string   `json:"data"`
+}
+
+type User struct {
+	ID int64 `json:"id"`
+}
+
+type InlineKeyboardMarkup struct {
+	InlineKeyboard [][]InlineKeyboardButton `json:"inline_keyboard"`
+}
+
+type InlineKeyboardButton struct {
+	Text         string `json:"text"`
+	CallbackData string `json:"callback_data,omitempty"`
 }
 
 type UpdateResponse struct {
@@ -59,29 +94,53 @@ type UpdateResponse struct {
 	Result []Update `json:"result"`
 }
 
+type TelegramMessageResponse struct {
+	Ok     bool    `json:"ok"`
+	Result Message `json:"result"`
+}
+
+func logDebug(format string, args ...interface{}) {
+	fmt.Printf("🪲 "+format+"\n", args...)
+}
+
+func logInfo(format string, args ...interface{}) {
+	fmt.Printf("ℹ️  "+format+"\n", args...)
+}
+
+func logError(format string, args ...interface{}) {
+	fmt.Printf("❌ "+format+"\n", args...)
+}
+
 func LoadConfig() (Config, error) {
+	logInfo("LoadConfig: пытаюсь прочитать config.json")
 	data, err := ioutil.ReadFile("config.json")
 	if err != nil {
+		logDebug("LoadConfig: config.json не найден, пробую get_config.py")
 		// Пытаемся загрузить из Python скрипта
 		cmd := exec.Command("python3", "get_config.py")
 		output, err := cmd.Output()
 		if err != nil {
+			logError("LoadConfig: get_config.py тоже не сработал: %v", err)
 			return Config{}, fmt.Errorf("не могу загрузить конфиг: %v", err)
 		}
 
 		var config Config
 		if err := json.Unmarshal(output, &config); err != nil {
+			logError("LoadConfig: ошибка парсинга вывода get_config.py: %v", err)
 			return Config{}, fmt.Errorf("ошибка парсинга конфига: %v", err)
 		}
 
+		logInfo("LoadConfig: конфиг загружен из get_config.py (BOT_TOKEN=%t, USER_ID=%s, NOTIFICATION_MINUTES=%d)", config.BotToken != "", config.UserID, config.NotificationMinutes)
 		return config, nil
 	}
 
 	var config Config
 	if err := json.Unmarshal(data, &config); err != nil {
+		logError("LoadConfig: ошибка парсинга config.json: %v", err)
 		return Config{}, fmt.Errorf("ошибка парсинга config.json: %v", err)
 	}
 
+	logInfo("LoadConfig: config.json загружен (BOT_TOKEN=%t, USER_ID=%s, NOTIFICATION_MINUTES=%d)", config.BotToken != "", config.UserID, config.NotificationMinutes)
 	return config, nil
 }
 
@@ -92,61 +151,81 @@ func NewTimetableBot(token, userID string) *TimetableBot {
 		schedule:                  []Lesson{},
 		sentNotifications:         make(map[string]bool),
 		sentDistanceNotifications: make(map[string]bool),
+		sentDailyGreetings:        make(map[string]bool),
+		lastScheduleMessages:      make(map[int64][]int),
 		lastUpdateID:              0,
 	}
 }
 
 func (bot *TimetableBot) LoadSchedule(filename string) error {
-	fmt.Println("📂 Загружаю расписание...")
+	logInfo("LoadSchedule: загружаю %s", filename)
 
 	data, err := ioutil.ReadFile(filename)
 	if err != nil {
-		fmt.Printf("❌ Файл %s не найден!\n", filename)
+		logError("LoadSchedule: файл %s не найден: %v", filename, err)
 		fmt.Println("💡 Запусти сначала парсер: python parser_full.py")
 		return err
 	}
+	logDebug("LoadSchedule: размер файла %s = %d байт", filename, len(data))
 
 	err = json.Unmarshal(data, &bot.schedule)
 	if err != nil {
-		fmt.Printf("❌ Ошибка парсинга JSON: %v\n", err)
+		logError("LoadSchedule: ошибка парсинга JSON: %v", err)
 		return err
 	}
 
-	fmt.Printf("✅ Загружено %d пар\n", len(bot.schedule))
+	logInfo("LoadSchedule: загружено %d пар", len(bot.schedule))
+	if len(bot.schedule) > 0 {
+		first := bot.schedule[0]
+		last := bot.schedule[len(bot.schedule)-1]
+		logDebug("LoadSchedule: первая пара=%s %s %s | последняя=%s %s %s", first.Date, first.TimeStart, first.Subject, last.Date, last.TimeStart, last.Subject)
+	}
 	return nil
 }
 
 func (bot *TimetableBot) UpdateSchedule() {
+	logInfo("UpdateSchedule: запускаю ./test_parser из %s", mustGetwd())
 	// Запускаем парсер для обновления расписания
 	cmd := exec.Command("./test_parser")
 	cmd.Dir = "."
 
 	output, err := cmd.CombinedOutput()
 	if err != nil {
-		fmt.Printf("❌ Ошибка запуска парсера: %v\n", err)
-		fmt.Printf("Вывод: %s\n", string(output))
+		logError("UpdateSchedule: ошибка запуска парсера: %v", err)
+		fmt.Printf("📝 UpdateSchedule output:\n%s\n", string(output))
 		return
 	}
+	logInfo("UpdateSchedule: parser completed successfully, output=%d bytes", len(output))
 
 	// Перезагружаем расписание из обновленного файла
 	err = bot.LoadSchedule("schedule.json")
 	if err != nil {
-		fmt.Printf("❌ Ошибка перезагрузки расписания: %v\n", err)
+		logError("UpdateSchedule: ошибка перезагрузки расписания: %v", err)
 		return
 	}
+	logInfo("UpdateSchedule: расписание перезагружено успешно")
 }
 
 func (bot *TimetableBot) SendMessage(message string) error {
-	endpoint := fmt.Sprintf("%s%s/sendMessage", TelegramAPIURL, BotToken)
+	return bot.SendMessageWithAnimation(message, RegularGifDir)
+}
+
+func (bot *TimetableBot) SendMessageWithAnimation(message, animationDir string) error {
+	endpoint := fmt.Sprintf("%s%s/sendMessage", TelegramAPIURL, bot.botToken)
+	logDebug("SendMessageWithAnimation: method=sendMessage chat_id=%s len(text)=%d animation_dir=%s", bot.userID, len(message), animationDir)
+
+	if _, err := bot.SendRandomAnimationToChat(bot.userID, animationDir); err != nil {
+		logError("SendMessageWithAnimation: GIF не отправился, продолжаю отправку текста: %v", err)
+	}
 
 	data := url.Values{}
-	data.Set("chat_id", UserID)
+	data.Set("chat_id", bot.userID)
 	data.Set("text", message)
 	data.Set("parse_mode", "HTML")
 
 	resp, err := http.PostForm(endpoint, data)
 	if err != nil {
-		fmt.Printf("❌ Ошибка отправки: %v\n", err)
+		logError("SendMessageWithAnimation: ошибка отправки: %v", err)
 		return err
 	}
 	defer resp.Body.Close()
@@ -154,14 +233,108 @@ func (bot *TimetableBot) SendMessage(message string) error {
 	if resp.StatusCode != http.StatusOK {
 		bodyBytes, _ := ioutil.ReadAll(resp.Body)
 		bodyString := string(bodyBytes)
-		fmt.Printf("❌ Ошибка Telegram API: статус %d\n", resp.StatusCode)
-		fmt.Printf("📝 Ответ сервера: %s\n", bodyString)
-		fmt.Printf("📤 Отправляемое сообщение: %s\n", message)
-		fmt.Printf("🆔 Chat ID: %s\n", UserID)
+		logError("SendMessageWithAnimation: Telegram API вернул статус %d", resp.StatusCode)
+		fmt.Printf("📝 SendMessageWithAnimation response: %s\n", bodyString)
+		fmt.Printf("📤 SendMessageWithAnimation payload: %s\n", message)
+		fmt.Printf("🆔 SendMessageWithAnimation chat_id: %s\n", bot.userID)
 		return fmt.Errorf("telegram error: %d: %s", resp.StatusCode, bodyString)
 	}
 
+	logDebug("SendMessageWithAnimation: текст успешно отправлен")
+
 	return nil
+}
+
+func (bot *TimetableBot) SendRandomAnimationToChat(chatID, dir string) (int, error) {
+	animationPath, err := randomAnimationPath(dir)
+	if err != nil {
+		return 0, err
+	}
+	if animationPath == "" {
+		logDebug("SendRandomAnimationToChat: нет GIF/MP4 файлов в %s, пропускаю", dir)
+		return 0, nil
+	}
+
+	file, err := os.Open(animationPath)
+	if err != nil {
+		return 0, fmt.Errorf("не удалось открыть animation %s: %w", animationPath, err)
+	}
+	defer file.Close()
+
+	var body bytes.Buffer
+	writer := multipart.NewWriter(&body)
+
+	if err := writer.WriteField("chat_id", chatID); err != nil {
+		return 0, fmt.Errorf("не удалось записать chat_id в multipart: %w", err)
+	}
+
+	part, err := writer.CreateFormFile("animation", filepath.Base(animationPath))
+	if err != nil {
+		return 0, fmt.Errorf("не удалось создать multipart file: %w", err)
+	}
+	if _, err := io.Copy(part, file); err != nil {
+		return 0, fmt.Errorf("не удалось записать animation в multipart: %w", err)
+	}
+	if err := writer.Close(); err != nil {
+		return 0, fmt.Errorf("не удалось закрыть multipart writer: %w", err)
+	}
+
+	endpoint := fmt.Sprintf("%s%s/sendAnimation", TelegramAPIURL, bot.botToken)
+	req, err := http.NewRequest(http.MethodPost, endpoint, &body)
+	if err != nil {
+		return 0, fmt.Errorf("не удалось создать sendAnimation request: %w", err)
+	}
+	req.Header.Set("Content-Type", writer.FormDataContentType())
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return 0, fmt.Errorf("ошибка sendAnimation: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		bodyBytes, _ := ioutil.ReadAll(resp.Body)
+		return 0, fmt.Errorf("sendAnimation telegram error: %s body=%s file=%s", resp.Status, string(bodyBytes), animationPath)
+	}
+
+	var response TelegramMessageResponse
+	if err := json.NewDecoder(resp.Body).Decode(&response); err != nil {
+		return 0, fmt.Errorf("ошибка декодирования sendAnimation response: %w", err)
+	}
+	if !response.Ok {
+		return 0, fmt.Errorf("sendAnimation response ok=false file=%s", animationPath)
+	}
+
+	logInfo("SendRandomAnimationToChat: отправлен GIF/MP4 %s chat_id=%s message_id=%d", animationPath, chatID, response.Result.MessageID)
+	return response.Result.MessageID, nil
+}
+
+func randomAnimationPath(dir string) (string, error) {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return "", nil
+		}
+		return "", fmt.Errorf("не удалось прочитать папку %s: %w", dir, err)
+	}
+
+	files := make([]string, 0, len(entries))
+	for _, entry := range entries {
+		if entry.IsDir() {
+			continue
+		}
+
+		ext := strings.ToLower(filepath.Ext(entry.Name()))
+		if ext == ".gif" || ext == ".mp4" {
+			files = append(files, filepath.Join(dir, entry.Name()))
+		}
+	}
+
+	if len(files) == 0 {
+		return "", nil
+	}
+
+	return files[rand.Intn(len(files))], nil
 }
 
 // escapeHTML экранирует специальные HTML символы для Telegram API
@@ -203,12 +376,196 @@ func ParseTime(dateStr, timeStr string) (time.Time, error) {
 	return time.ParseInLocation("02.01.2006 15:04", dateTimeStr, loc)
 }
 
-func (bot *TimetableBot) GetUpcomingLessons() []Lesson {
-	// Используем московское время (Europe/Moscow)
+func moscowLocation() *time.Location {
 	loc, err := time.LoadLocation("Europe/Moscow")
 	if err != nil {
-		loc = time.Local
+		return time.Local
 	}
+	return loc
+}
+
+func (bot *TimetableBot) GetLessonsForDate(dateStr string) []Lesson {
+	lessons := []Lesson{}
+	for _, lesson := range bot.schedule {
+		if lesson.Date == dateStr {
+			lessons = append(lessons, lesson)
+		}
+	}
+
+	sort.SliceStable(lessons, func(i, j int) bool {
+		left, leftErr := ParseTime(lessons[i].Date, lessons[i].TimeStart)
+		right, rightErr := ParseTime(lessons[j].Date, lessons[j].TimeStart)
+		if leftErr != nil || rightErr != nil {
+			return lessons[i].TimeStart < lessons[j].TimeStart
+		}
+		return left.Before(right)
+	})
+
+	return lessons
+}
+
+func (bot *TimetableBot) FindNextLesson(after time.Time) (Lesson, time.Time, bool) {
+	loc := moscowLocation()
+	after = after.In(loc)
+
+	var next Lesson
+	var nextStart time.Time
+	found := false
+
+	for _, lesson := range bot.schedule {
+		start, err := ParseTime(lesson.Date, lesson.TimeStart)
+		if err != nil || !start.After(after) {
+			continue
+		}
+
+		if !found || start.Before(nextStart) {
+			next = lesson
+			nextStart = start
+			found = true
+		}
+	}
+
+	return next, nextStart, found
+}
+
+func lessonMode(room string) string {
+	if isDistanceLearning(room) {
+		return "дистант"
+	}
+	return "очная"
+}
+
+func lessonCountWord(count int) string {
+	mod10 := count % 10
+	mod100 := count % 100
+	if mod10 == 1 && mod100 != 11 {
+		return "пара"
+	}
+	if mod10 >= 2 && mod10 <= 4 && (mod100 < 12 || mod100 > 14) {
+		return "пары"
+	}
+	return "пар"
+}
+
+func roomText(room string) string {
+	room = strings.TrimSpace(room)
+	if room == "" {
+		return "не указана"
+	}
+	return room
+}
+
+func joinTimes(times []string) string {
+	switch len(times) {
+	case 0:
+		return ""
+	case 1:
+		return times[0]
+	case 2:
+		return times[0] + " и " + times[1]
+	default:
+		return strings.Join(times[:len(times)-1], ", ") + " и " + times[len(times)-1]
+	}
+}
+
+func formatDurationLeft(duration time.Duration) string {
+	if duration < time.Minute {
+		return "меньше минуты"
+	}
+
+	totalMinutes := int(duration.Round(time.Minute).Minutes())
+	days := totalMinutes / (24 * 60)
+	totalMinutes %= 24 * 60
+	hours := totalMinutes / 60
+	minutes := totalMinutes % 60
+
+	parts := []string{}
+	if days > 0 {
+		parts = append(parts, fmt.Sprintf("%d д", days))
+	}
+	if hours > 0 {
+		parts = append(parts, fmt.Sprintf("%d ч", hours))
+	}
+	if minutes > 0 || len(parts) == 0 {
+		parts = append(parts, fmt.Sprintf("%d мин", minutes))
+	}
+
+	if len(parts) > 2 {
+		parts = parts[:2]
+	}
+
+	return strings.Join(parts, " ")
+}
+
+func (bot *TimetableBot) BuildNextLessonMessage(now time.Time) string {
+	lesson, start, found := bot.FindNextLesson(now)
+	if !found {
+		return "Ближайших пар не нашел."
+	}
+
+	left := formatDurationLeft(start.Sub(now.In(moscowLocation())))
+	return fmt.Sprintf(
+		"⏭ <b>Ближайшая пара</b>\n\n"+
+			"📚 %s\n"+
+			"🕐 %s-%s\n"+
+			"🚪 %s\n"+
+			"📍 %s\n"+
+			"⏳ Осталось: %s\n"+
+			"📅 %s (%s)",
+		escapeHTML(lesson.Subject),
+		lesson.TimeStart,
+		lesson.TimeEnd,
+		escapeHTML(roomText(lesson.Room)),
+		lessonMode(lesson.Room),
+		left,
+		lesson.Date,
+		lesson.Weekday,
+	)
+}
+
+func (bot *TimetableBot) BuildMorningSummary(date time.Time) string {
+	dateStr := date.In(moscowLocation()).Format("02.01.2006")
+	lessons := bot.GetLessonsForDate(dateStr)
+	if len(lessons) == 0 {
+		return "☀️ <b>Доброе утро</b>\n\nСегодня пар нет, можно выдохнуть."
+	}
+
+	first := lessons[0]
+	return fmt.Sprintf(
+		"☀️ <b>Доброе утро</b>\n\nСегодня %d %s, первая в %s, %s.",
+		len(lessons),
+		lessonCountWord(len(lessons)),
+		first.TimeStart,
+		lessonMode(first.Room),
+	)
+}
+
+func (bot *TimetableBot) BuildEveningSummary(date time.Time) string {
+	loc := moscowLocation()
+	tomorrow := date.In(loc).AddDate(0, 0, 1)
+	lessons := bot.GetLessonsForDate(tomorrow.Format("02.01.2006"))
+	if len(lessons) == 0 {
+		return "🌙 <b>Завтра</b>\n\nЗавтра пар нет, можно выдохнуть."
+	}
+
+	times := make([]string, 0, len(lessons))
+	for _, lesson := range lessons {
+		times = append(times, lesson.TimeStart)
+	}
+
+	first := lessons[0]
+	return fmt.Sprintf(
+		"🌙 <b>Завтра</b>\n\nЗавтра %d %s: %s. Первая аудитория: %s.",
+		len(lessons),
+		lessonCountWord(len(lessons)),
+		joinTimes(times),
+		escapeHTML(roomText(first.Room)),
+	)
+}
+
+func (bot *TimetableBot) GetUpcomingLessons() []Lesson {
+	// Используем московское время (Europe/Moscow)
+	loc := moscowLocation()
 	now := time.Now().In(loc)
 	upcoming := []Lesson{}
 
@@ -246,7 +603,9 @@ func isDistanceLearning(room string) bool {
 
 // SendDistanceLearningNotification отправляет уведомление о дистанционных парах за день
 func (bot *TimetableBot) SendDistanceLearningNotification(date string, lessons []Lesson) {
+	logInfo("SendDistanceLearningNotification: date=%s lessons=%d already_sent=%t", date, len(lessons), bot.sentDistanceNotifications[date])
 	if bot.sentDistanceNotifications[date] {
+		logDebug("SendDistanceLearningNotification: пропуск, уже отправляли на %s", date)
 		return
 	}
 
@@ -270,8 +629,10 @@ func (bot *TimetableBot) SendDistanceLearningNotification(date string, lessons [
 
 	err := bot.SendMessage(message)
 	if err == nil {
-		fmt.Printf("✅ Отправлено уведомление о дистанционных парах на %s\n", date)
+		logInfo("SendDistanceLearningNotification: отправлено на %s", date)
 		bot.sentDistanceNotifications[date] = true
+	} else {
+		logError("SendDistanceLearningNotification: ошибка отправки на %s: %v", date, err)
 	}
 }
 
@@ -309,31 +670,41 @@ func (bot *TimetableBot) HasInPersonLessonsToday() bool {
 func (bot *TimetableBot) CheckAndSendNotifications() {
 	now := time.Now()
 	upcoming := bot.GetUpcomingLessons()
+	logDebug("CheckAndSendNotifications: now=%s upcoming=%d sent=%d", now.Format(time.RFC3339), len(upcoming), len(bot.sentNotifications))
 
-	// Проверяем: если ВСЕ пары дистанционные (нет очных) - отправляем утреннее уведомление в 8:00
 	loc, _ := time.LoadLocation("Europe/Moscow")
 	nowInMoscow := now.In(loc)
+	bot.CheckAndSendDailyGreetings(nowInMoscow)
+
+	// Проверяем: если ВСЕ пары дистанционные (нет очных) - отправляем утреннее уведомление в 8:00
 	if nowInMoscow.Hour() == 8 && nowInMoscow.Minute() == 0 {
+		logInfo("CheckAndSendNotifications: наступило 08:00 Moscow")
 		// Отправляем утреннее уведомление только если нет очных пар
 		if !bot.HasInPersonLessonsToday() {
+			logInfo("CheckAndSendNotifications: сегодня нет очных пар, проверяю дистанционные")
 			distanceLessons := bot.GetTodayDistanceLessons()
 			for date, lessons := range distanceLessons {
 				bot.SendDistanceLearningNotification(date, lessons)
 			}
+		} else {
+			logDebug("CheckAndSendNotifications: есть очные пары, утреннее дистанционное уведомление не нужно")
 		}
 	}
 
 	// Отправляем обычные уведомления за 30 минут
 	for _, lesson := range upcoming {
+		logDebug("CheckAndSendNotifications: candidate lesson=%s date=%s start=%s notify_at=%s", lesson.Subject, lesson.Date, lesson.TimeStart, lesson.Notification.Format(time.RFC3339))
 		// Если есть очные пары сегодня - отправляем уведомления для ВСЕХ пар (включая дистанционные)
 		// Если НЕТ очных пар - пропускаем дистанционные (они уже получили утреннее уведомление)
 		if !bot.HasInPersonLessonsToday() && isDistanceLearning(lesson.Room) {
+			logDebug("CheckAndSendNotifications: skip distance lesson=%s date=%s", lesson.Subject, lesson.Date)
 			continue
 		}
 
 		lessonKey := fmt.Sprintf("%s_%s_%s", lesson.Date, lesson.LessonNumber, lesson.Subject)
 
 		if bot.sentNotifications[lessonKey] {
+			logDebug("CheckAndSendNotifications: already sent lessonKey=%s", lessonKey)
 			continue
 		}
 
@@ -341,14 +712,54 @@ func (bot *TimetableBot) CheckAndSendNotifications() {
 
 		// Отправляем если осталось меньше 60 секунд
 		if timeDiff >= 0 && timeDiff <= 60 {
+			logInfo("CheckAndSendNotifications: sending lessonKey=%s timeDiff=%.1fs", lessonKey, timeDiff)
 			message := bot.FormatNotification(&lesson)
 			err := bot.SendMessage(message)
 			if err == nil {
-				fmt.Printf("✅ Отправлено уведомление: %s (%s %s)\n",
+				logInfo("CheckAndSendNotifications: отправлено уведомление: %s (%s %s)",
 					lesson.Subject, lesson.Date, lesson.TimeStart)
 				bot.sentNotifications[lessonKey] = true
+			} else {
+				logError("CheckAndSendNotifications: ошибка отправки уведомления lessonKey=%s: %v", lessonKey, err)
 			}
 		}
+	}
+}
+
+func (bot *TimetableBot) CheckAndSendDailyGreetings(now time.Time) {
+	date := now.Format("02.01.2006")
+
+	if now.Hour() == 9 && now.Minute() == 0 {
+		key := "gm_" + date
+		if bot.sentDailyGreetings[key] {
+			logDebug("CheckAndSendDailyGreetings: morning already sent key=%s", key)
+			return
+		}
+
+		message := bot.BuildMorningSummary(now)
+		logInfo("CheckAndSendDailyGreetings: отправляю доброе утро date=%s", date)
+		if err := bot.SendMessageWithAnimation(message, MorningGifDir); err != nil {
+			logError("CheckAndSendDailyGreetings: ошибка утреннего сообщения date=%s: %v", date, err)
+			return
+		}
+		bot.sentDailyGreetings[key] = true
+		return
+	}
+
+	if now.Hour() == 21 && now.Minute() == 22 {
+		key := "evening_" + date
+		if bot.sentDailyGreetings[key] {
+			logDebug("CheckAndSendDailyGreetings: evening already sent key=%s", key)
+			return
+		}
+
+		message := bot.BuildEveningSummary(now)
+		logInfo("CheckAndSendDailyGreetings: отправляю вечерний summary date=%s", date)
+		if err := bot.SendMessageWithAnimation(message, EveningGifDir); err != nil {
+			logError("CheckAndSendDailyGreetings: ошибка вечернего сообщения date=%s: %v", date, err)
+			return
+		}
+		bot.sentDailyGreetings[key] = true
 	}
 }
 
@@ -356,8 +767,10 @@ func (bot *TimetableBot) RunScheduler() {
 	fmt.Println("\n" + strings.Repeat("=", 60))
 	fmt.Println("🤖 БОТ ЗАПУЩЕН")
 	fmt.Println(strings.Repeat("=", 60))
-	fmt.Println("⏰ Проверяю расписание каждую минуту...")
-	fmt.Printf("🔔 Буду отправлять уведомления за %d минут до пары\n", NotificationMinutes)
+	logInfo("RunScheduler: version=%s pid=%d cwd=%s exe=%s", AppVersion, os.Getpid(), mustGetwd(), mustExecutable())
+	logInfo("RunScheduler: schedule_len=%d user_id=%s notification_minutes=%d", len(bot.schedule), bot.userID, NotificationMinutes)
+	logInfo("RunScheduler: polling every %s", CheckInterval)
+	logInfo("RunScheduler: notification window=%d minutes", NotificationMinutes)
 	fmt.Println("💡 Для остановки нажми Ctrl+C")
 
 	ticker := time.NewTicker(CheckInterval)
@@ -370,6 +783,7 @@ func (bot *TimetableBot) RunScheduler() {
 	// Запускаем опрос обновлений в отдельной горутине
 	go func() {
 		for {
+			logDebug("RunScheduler: PollUpdates tick")
 			bot.PollUpdates()
 			time.Sleep(1 * time.Second)
 		}
@@ -381,30 +795,35 @@ func (bot *TimetableBot) RunScheduler() {
 	for {
 		select {
 		case <-ticker.C:
+			logDebug("RunScheduler: minute tick")
 			// Проверяем нужно ли запустить парсер (каждый день в 2:00)
 			loc, _ := time.LoadLocation("Europe/Moscow")
 			nowMoscow := time.Now().In(loc)
+			logDebug("RunScheduler: Moscow time=%s", nowMoscow.Format(time.RFC3339))
 
 			// Если сейчас 2:00 и парсер не запускался сегодня
 			if nowMoscow.Hour() == 2 && nowMoscow.Minute() == 0 {
 				if time.Since(lastParserRun) > 23*time.Hour {
-					fmt.Println("\n🔄 Запуск парсера для обновления расписания...")
+					logInfo("RunScheduler: запускаю обновление расписания по расписанию")
 					bot.UpdateSchedule()
 					lastParserRun = time.Now()
-					fmt.Println("✅ Расписание обновлено\n")
+					logInfo("RunScheduler: расписание обновлено")
 				}
 			}
 
 			bot.CheckAndSendNotifications()
 		case <-sigChan:
 			fmt.Println("\n\n⏹️  Бот остановлен")
+			logInfo("RunScheduler: получен сигнал остановки")
 			return
 		}
 	}
 }
 
 func (bot *TimetableBot) Run() {
+	logInfo("Run: стартую загрузку расписания")
 	if err := bot.LoadSchedule("schedule.json"); err != nil {
+		logError("Run: не удалось загрузить расписание: %v", err)
 		return
 	}
 
@@ -414,51 +833,360 @@ func (bot *TimetableBot) Run() {
 
 func (bot *TimetableBot) PollUpdates() {
 	endpoint := fmt.Sprintf("%s%s/getUpdates", TelegramAPIURL, bot.botToken)
+	logDebug("PollUpdates: method=getUpdates offset=%d", bot.lastUpdateID+1)
 
 	data := url.Values{}
 	data.Set("offset", fmt.Sprintf("%d", bot.lastUpdateID+1))
 	data.Set("timeout", "30")
 
+	// Отправляем GET вместо POST, чтобы избежать проблем с заголовками,
+	// или явно указываем Content-Type: application/x-www-form-urlencoded
 	resp, err := http.PostForm(endpoint, data)
 	if err != nil {
-		fmt.Printf("⚠️ Ошибка получения обновлений: %v\n", err)
+		logError("PollUpdates: ошибка получения обновлений: %v", err)
 		return
 	}
 	defer resp.Body.Close()
+	logDebug("PollUpdates: HTTP status=%s", resp.Status)
+	if resp.StatusCode != http.StatusOK {
+		bodyBytes, _ := ioutil.ReadAll(resp.Body)
+		logError("PollUpdates: Telegram вернул %s body=%s", resp.Status, string(bodyBytes))
+		return
+	}
 
 	var response UpdateResponse
 	if err := json.NewDecoder(resp.Body).Decode(&response); err != nil {
-		fmt.Printf("⚠️ Ошибка декодирования обновлений: %v\n", err)
+		logError("PollUpdates: ошибка декодирования обновлений: %v", err)
 		return
 	}
 
 	if !response.Ok {
+		logError("PollUpdates: Telegram response ok=false")
 		return
 	}
+	logDebug("PollUpdates: получено %d updates", len(response.Result))
 
 	for _, update := range response.Result {
+		logDebug("PollUpdates: update_id=%d has_message=%t has_callback=%t", update.UpdateID, update.Message != nil, update.CallbackQuery != nil)
 		bot.lastUpdateID = update.UpdateID
 		bot.HandleUpdate(update)
 	}
 }
 
 func (bot *TimetableBot) HandleUpdate(update Update) {
+	if update.CallbackQuery != nil {
+		logInfo("HandleUpdate: callback_query id=%s from=%d data=%s", update.CallbackQuery.ID, update.CallbackQuery.From.ID, update.CallbackQuery.Data)
+		bot.HandleCallbackQuery(update.CallbackQuery)
+		return
+	}
+
+	if update.Message == nil {
+		logDebug("HandleUpdate: пустое update без message и callback")
+		return
+	}
+
 	// Логируем входящее сообщение
-	fmt.Printf("📩 Получено сообщение от %d: %s\n", update.Message.Chat.ID, update.Message.Text)
+	logInfo("HandleUpdate: message_id=%d chat_id=%d text=%q", update.Message.MessageID, update.Message.Chat.ID, update.Message.Text)
 
 	if update.Message.Text == "/start" {
 		welcomeMsg := "👋 Привет! Я бот расписания МГУ ВШГА.\n\n" +
 			"Я буду присылать уведомления за 15 минут до начала пар.\n" +
-			"Расписание обновляется автоматически каждый день в 2:00.\n\n" +
+			"Остальные команды:\n" +
+			"/schedule - Посмотреть расписание\n" +
+			"/next - Ближайшая пара\n\n" +
 			"Твой ID: " + fmt.Sprintf("%d", update.Message.Chat.ID) + "\n" +
 			"(Убедись, что этот ID прописан в config.json)"
 
+		logInfo("HandleUpdate: отправляю /start ответ chat_id=%d", update.Message.Chat.ID)
 		bot.SendMessageToChat(update.Message.Chat.ID, welcomeMsg)
+	} else if update.Message.Text == "/schedule" {
+		loc, _ := time.LoadLocation("Europe/Moscow")
+		today := time.Now().In(loc)
+		logInfo("HandleUpdate: /schedule requested chat_id=%d today=%s", update.Message.Chat.ID, today.Format("02.01.2006"))
+		text, markup := bot.BuildScheduleMessageAndMarkup(today)
+
+		logDebug("HandleUpdate: /schedule response text_len=%d", len(text))
+		if err := bot.SendScheduleToChat(update.Message.Chat.ID, update.Message.MessageID, text, markup); err != nil {
+			logError("HandleUpdate: /schedule send failed chat_id=%d: %v", update.Message.Chat.ID, err)
+		}
+	} else if update.Message.Text == "/next" {
+		loc := moscowLocation()
+		now := time.Now().In(loc)
+		logInfo("HandleUpdate: /next requested chat_id=%d now=%s", update.Message.Chat.ID, now.Format(time.RFC3339))
+		text := bot.BuildNextLessonMessage(now)
+
+		if err := bot.SendMessageToChat(update.Message.Chat.ID, text); err != nil {
+			logError("HandleUpdate: /next send failed chat_id=%d: %v", update.Message.Chat.ID, err)
+		}
+	} else {
+		logDebug("HandleUpdate: message ignored text=%q", update.Message.Text)
 	}
+}
+
+func (bot *TimetableBot) HandleCallbackQuery(query *CallbackQuery) {
+	logInfo("HandleCallbackQuery: callback_id=%s from=%d data=%s message_id=%d", query.ID, query.From.ID, query.Data, func() int {
+		if query.Message != nil {
+			return query.Message.MessageID
+		}
+		return 0
+	}())
+	// Сразу отвечаем, чтобы убрать иконку загрузки
+	bot.AnswerCallbackQuery(query.ID)
+
+	if strings.HasPrefix(query.Data, "date:") {
+		dateStr := strings.TrimPrefix(query.Data, "date:")
+		loc, _ := time.LoadLocation("Europe/Moscow")
+		logDebug("HandleCallbackQuery: parsed date string=%s", dateStr)
+
+		// Парсим дату из callback
+		parsedDate, err := time.ParseInLocation("02.01.2006", dateStr, loc)
+		if err != nil {
+			logError("HandleCallbackQuery: ошибка парсинга даты из callback: %v", err)
+			return
+		}
+
+		text, markup := bot.BuildScheduleMessageAndMarkup(parsedDate)
+		logInfo("HandleCallbackQuery: rebuilding schedule for %s text_len=%d", parsedDate.Format("02.01.2006"), len(text))
+
+		if query.Message != nil {
+			if err := bot.EditMessageText(query.Message.Chat.ID, query.Message.MessageID, text, markup); err != nil {
+				logError("HandleCallbackQuery: editMessageText failed: %v", err)
+			}
+		} else {
+			logError("HandleCallbackQuery: query.Message=nil, нечего редактировать")
+		}
+	} else {
+		logDebug("HandleCallbackQuery: unsupported callback data=%s", query.Data)
+	}
+}
+
+func (bot *TimetableBot) AnswerCallbackQuery(callbackQueryID string) {
+	endpoint := fmt.Sprintf("%s%s/answerCallbackQuery", TelegramAPIURL, bot.botToken)
+	logDebug("AnswerCallbackQuery: callback_query_id=%s", callbackQueryID)
+	data := url.Values{}
+	data.Set("callback_query_id", callbackQueryID)
+	resp, err := http.PostForm(endpoint, data)
+	if err != nil {
+		logError("AnswerCallbackQuery: error=%v", err)
+		return
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		bodyBytes, _ := ioutil.ReadAll(resp.Body)
+		logError("AnswerCallbackQuery: status=%s body=%s", resp.Status, string(bodyBytes))
+		return
+	}
+	logDebug("AnswerCallbackQuery: ok")
+}
+
+func (bot *TimetableBot) BuildScheduleMessageAndMarkup(date time.Time) (string, InlineKeyboardMarkup) {
+	dateStr := date.Format("02.01.2006")
+	logDebug("BuildScheduleMessageAndMarkup: date=%s schedule_len=%d", dateStr, len(bot.schedule))
+
+	// Ищем пары на эту дату
+	var lessonsForDay []Lesson
+	for _, l := range bot.schedule {
+		if l.Date == dateStr {
+			lessonsForDay = append(lessonsForDay, l)
+		}
+	}
+
+	logInfo("BuildScheduleMessageAndMarkup: date=%s lessons=%d", dateStr, len(lessonsForDay))
+	if len(lessonsForDay) > 0 {
+		for i, l := range lessonsForDay {
+			logDebug("BuildScheduleMessageAndMarkup: lesson[%d]=%s %s %s room=%s teacher=%s", i, l.LessonNumber, l.TimeStart, l.Subject, l.Room, l.Teacher)
+		}
+	}
+
+	// Формируем текст
+	var b strings.Builder
+	b.WriteString(fmt.Sprintf("📅 <b>Расписание на %s</b>\n\n", dateStr))
+
+	if len(lessonsForDay) == 0 {
+		b.WriteString("<i>Пар нет! Можно отдыхать 🛌</i>")
+	} else {
+		for _, l := range lessonsForDay {
+			b.WriteString(fmt.Sprintf("<b>%s пара</b> (%s-%s)\n", l.LessonNumber, l.TimeStart, l.TimeEnd))
+			b.WriteString(fmt.Sprintf("📚 %s\n", escapeHTML(l.Subject)))
+			if l.Teacher != "" {
+				b.WriteString(fmt.Sprintf("👨‍🏫 %s\n", escapeHTML(l.Teacher)))
+			}
+			b.WriteString(fmt.Sprintf("🚪 %s\n\n", escapeHTML(l.Room)))
+		}
+	}
+
+	// Формируем клавиатуру
+	yesterday := date.AddDate(0, 0, -1).Format("02.01.2006")
+	tomorrow := date.AddDate(0, 0, 1).Format("02.01.2006")
+
+	markup := InlineKeyboardMarkup{
+		InlineKeyboard: [][]InlineKeyboardButton{
+			{
+				{Text: "⬅️ Назад", CallbackData: "date:" + yesterday},
+				{Text: "Вперед ➡️", CallbackData: "date:" + tomorrow},
+			},
+		},
+	}
+
+	return b.String(), markup
+}
+
+func (bot *TimetableBot) EditMessageText(chatID int64, messageID int, text string, markup InlineKeyboardMarkup) error {
+	endpoint := fmt.Sprintf("%s%s/editMessageText", TelegramAPIURL, bot.botToken)
+	logDebug("EditMessageText: chat_id=%d message_id=%d text_len=%d", chatID, messageID, len(text))
+
+	data := url.Values{}
+	data.Set("chat_id", fmt.Sprintf("%d", chatID))
+	data.Set("message_id", fmt.Sprintf("%d", messageID))
+	data.Set("text", text)
+	data.Set("parse_mode", "HTML")
+
+	markupBytes, err := json.Marshal(markup)
+	if err == nil {
+		data.Set("reply_markup", string(markupBytes))
+		logDebug("EditMessageText: reply_markup=%s", string(markupBytes))
+	} else {
+		logError("EditMessageText: marshal reply_markup failed: %v", err)
+	}
+
+	resp, err := http.PostForm(endpoint, data)
+	if err != nil {
+		logError("EditMessageText: ошибка редактирования сообщения: %v", err)
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		bodyBytes, _ := ioutil.ReadAll(resp.Body)
+		logError("EditMessageText: Telegram status=%s body=%s", resp.Status, string(bodyBytes))
+		return fmt.Errorf("editMessageText telegram error: %s", resp.Status)
+	}
+	logInfo("EditMessageText: ok chat_id=%d message_id=%d", chatID, messageID)
+	return nil
+}
+
+func (bot *TimetableBot) SendScheduleToChat(chatID int64, commandMessageID int, message string, markup InlineKeyboardMarkup) error {
+	bot.DeletePreviousScheduleMessages(chatID)
+	if commandMessageID != 0 {
+		if err := bot.DeleteMessage(chatID, commandMessageID); err != nil {
+			logError("SendScheduleToChat: не удалось удалить команду /schedule chat_id=%d message_id=%d: %v", chatID, commandMessageID, err)
+		}
+	}
+
+	messageIDs := []int{}
+	animationID, err := bot.SendRandomAnimationToChat(fmt.Sprintf("%d", chatID), RegularGifDir)
+	if err != nil {
+		logError("SendScheduleToChat: GIF не отправился, продолжаю отправку расписания chat_id=%d: %v", chatID, err)
+	}
+	if animationID != 0 {
+		messageIDs = append(messageIDs, animationID)
+	}
+
+	messageID, err := bot.SendMessageToChatWithMarkup(chatID, message, markup)
+	if err != nil {
+		if len(messageIDs) > 0 {
+			bot.lastScheduleMessages[chatID] = messageIDs
+		}
+		return err
+	}
+	if messageID != 0 {
+		messageIDs = append(messageIDs, messageID)
+	}
+
+	if len(messageIDs) > 0 {
+		bot.lastScheduleMessages[chatID] = messageIDs
+	}
+	return nil
+}
+
+func (bot *TimetableBot) DeletePreviousScheduleMessages(chatID int64) {
+	messageIDs := bot.lastScheduleMessages[chatID]
+	if len(messageIDs) == 0 {
+		return
+	}
+
+	logInfo("DeletePreviousScheduleMessages: удаляю %d старых schedule сообщений chat_id=%d", len(messageIDs), chatID)
+	for _, messageID := range messageIDs {
+		if messageID == 0 {
+			continue
+		}
+		if err := bot.DeleteMessage(chatID, messageID); err != nil {
+			logError("DeletePreviousScheduleMessages: не удалось удалить chat_id=%d message_id=%d: %v", chatID, messageID, err)
+		}
+	}
+	delete(bot.lastScheduleMessages, chatID)
+}
+
+func (bot *TimetableBot) DeleteMessage(chatID int64, messageID int) error {
+	endpoint := fmt.Sprintf("%s%s/deleteMessage", TelegramAPIURL, bot.botToken)
+	logDebug("DeleteMessage: chat_id=%d message_id=%d", chatID, messageID)
+
+	data := url.Values{}
+	data.Set("chat_id", fmt.Sprintf("%d", chatID))
+	data.Set("message_id", fmt.Sprintf("%d", messageID))
+
+	resp, err := http.PostForm(endpoint, data)
+	if err != nil {
+		return fmt.Errorf("ошибка deleteMessage: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		bodyBytes, _ := ioutil.ReadAll(resp.Body)
+		return fmt.Errorf("deleteMessage telegram error: %s body=%s", resp.Status, string(bodyBytes))
+	}
+
+	logDebug("DeleteMessage: ok chat_id=%d message_id=%d", chatID, messageID)
+	return nil
+}
+
+func (bot *TimetableBot) SendMessageToChatWithMarkup(chatID int64, message string, markup InlineKeyboardMarkup) (int, error) {
+	endpoint := fmt.Sprintf("%s%s/sendMessage", TelegramAPIURL, bot.botToken)
+	logDebug("SendMessageToChatWithMarkup: chat_id=%d text_len=%d", chatID, len(message))
+
+	data := url.Values{}
+	data.Set("chat_id", fmt.Sprintf("%d", chatID))
+	data.Set("text", message)
+	data.Set("parse_mode", "HTML")
+
+	markupBytes, err := json.Marshal(markup)
+	if err == nil {
+		data.Set("reply_markup", string(markupBytes))
+		logDebug("SendMessageToChatWithMarkup: reply_markup=%s", string(markupBytes))
+	} else {
+		logError("SendMessageToChatWithMarkup: marshal reply_markup failed: %v", err)
+	}
+
+	resp, err := http.PostForm(endpoint, data)
+	if err != nil {
+		logError("SendMessageToChatWithMarkup: ошибка отправки с кнопками: %v", err)
+		return 0, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		bodyBytes, _ := ioutil.ReadAll(resp.Body)
+		logError("SendMessageToChatWithMarkup: Telegram status=%s body=%s", resp.Status, string(bodyBytes))
+		return 0, fmt.Errorf("sendMessage telegram error: %s", resp.Status)
+	}
+
+	var response TelegramMessageResponse
+	if err := json.NewDecoder(resp.Body).Decode(&response); err != nil {
+		return 0, fmt.Errorf("ошибка декодирования sendMessage response: %w", err)
+	}
+	if !response.Ok {
+		return 0, fmt.Errorf("sendMessage response ok=false")
+	}
+	logInfo("SendMessageToChatWithMarkup: ok chat_id=%d message_id=%d", chatID, response.Result.MessageID)
+
+	return response.Result.MessageID, nil
 }
 
 func (bot *TimetableBot) SendMessageToChat(chatID int64, message string) error {
 	endpoint := fmt.Sprintf("%s%s/sendMessage", TelegramAPIURL, bot.botToken)
+	logDebug("SendMessageToChat: chat_id=%d text_len=%d", chatID, len(message))
+
+	if _, err := bot.SendRandomAnimationToChat(fmt.Sprintf("%d", chatID), RegularGifDir); err != nil {
+		logError("SendMessageToChat: GIF не отправился, продолжаю отправку текста chat_id=%d: %v", chatID, err)
+	}
 
 	data := url.Values{}
 	data.Set("chat_id", fmt.Sprintf("%d", chatID))
@@ -467,20 +1195,27 @@ func (bot *TimetableBot) SendMessageToChat(chatID int64, message string) error {
 
 	resp, err := http.PostForm(endpoint, data)
 	if err != nil {
-		fmt.Printf("❌ Ошибка отправки: %v\n", err)
+		logError("SendMessageToChat: ошибка отправки: %v", err)
 		return err
 	}
 	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		bodyBytes, _ := ioutil.ReadAll(resp.Body)
+		logError("SendMessageToChat: Telegram status=%s body=%s", resp.Status, string(bodyBytes))
+		return fmt.Errorf("sendMessage telegram error: %s", resp.Status)
+	}
+	logInfo("SendMessageToChat: ok chat_id=%d", chatID)
 
 	return nil
 }
 
 func main() {
 	fmt.Println("⚙️  Загружаю конфигурацию...")
+	logInfo("main: version=%s pid=%d cwd=%s exe=%s", AppVersion, os.Getpid(), mustGetwd(), mustExecutable())
 
 	config, err := LoadConfig()
 	if err != nil {
-		fmt.Printf("❌ Ошибка загрузки конфига: %v\n", err)
+		logError("main: ошибка загрузки конфига: %v", err)
 		os.Exit(1)
 	}
 
@@ -489,11 +1224,31 @@ func main() {
 	NotificationMinutes = config.NotificationMinutes
 
 	if BotToken == "" || UserID == "" {
-		fmt.Println("❌ config.py не заполнен!")
+		logError("main: config.py/config.json не заполнен")
 		fmt.Println("💡 Скопируй config.example.py -> config.py и заполни токен и ID")
 		os.Exit(1)
 	}
 
 	bot := NewTimetableBot(BotToken, UserID)
+	logInfo("main: bot created user_id=%s schedule_len=%d", UserID, len(bot.schedule))
 	bot.Run()
+}
+
+func mustGetwd() string {
+	wd, err := os.Getwd()
+	if err != nil {
+		return fmt.Sprintf("<cwd error: %v>", err)
+	}
+	return wd
+}
+
+func mustExecutable() string {
+	exe, err := os.Executable()
+	if err != nil {
+		return fmt.Sprintf("<exe error: %v>", err)
+	}
+	if rel, err := filepath.EvalSymlinks(exe); err == nil {
+		return rel
+	}
+	return exe
 }
