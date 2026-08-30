@@ -1,13 +1,9 @@
 package main
 
 import (
-	"bytes"
 	"encoding/json"
 	"fmt"
-	"io"
 	"io/ioutil"
-	"math/rand"
-	"mime/multipart"
 	"net/http"
 	"net/url"
 	"os"
@@ -18,6 +14,10 @@ import (
 	"strings"
 	"syscall"
 	"time"
+	// GIF_DISABLED: "bytes"
+	// GIF_DISABLED: "io"
+	// GIF_DISABLED: "math/rand"
+	// GIF_DISABLED: "mime/multipart"
 )
 
 const (
@@ -25,9 +25,9 @@ const (
 	TelegramAPIURL = "https://api.telegram.org/bot"
 	AppVersion     = "smart-summary-2026-04-29-2"
 
-	RegularGifDir = "assets/gif/regular"
-	MorningGifDir = "assets/gif/gm"
-	EveningGifDir = "assets/gif/evening"
+	// GIF_DISABLED: RegularGifDir = "assets/gif/regular"
+	// GIF_DISABLED: MorningGifDir = "assets/gif/gm"
+	// GIF_DISABLED: EveningGifDir = "assets/gif/evening"
 )
 
 var (
@@ -207,8 +207,41 @@ func (bot *TimetableBot) UpdateSchedule() {
 }
 
 func (bot *TimetableBot) SendMessage(message string) error {
-	return bot.SendMessageWithAnimation(message, RegularGifDir)
+	// GIF_DISABLED: was return bot.SendMessageWithAnimation(message, RegularGifDir)
+	endpoint := fmt.Sprintf("%s%s/sendMessage", TelegramAPIURL, bot.botToken)
+	logDebug("SendMessage: method=sendMessage chat_id=%s len(text)=%d", bot.userID, len(message))
+
+	data := url.Values{}
+	data.Set("chat_id", bot.userID)
+	data.Set("text", message)
+	data.Set("parse_mode", "HTML")
+
+	resp, err := http.PostForm(endpoint, data)
+	if err != nil {
+		logError("SendMessage: ошибка отправки: %v", err)
+		return err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		bodyBytes, _ := ioutil.ReadAll(resp.Body)
+		bodyString := string(bodyBytes)
+		logError("SendMessage: Telegram API вернул статус %d", resp.StatusCode)
+		return fmt.Errorf("telegram error: %d: %s", resp.StatusCode, bodyString)
+	}
+
+	logDebug("SendMessage: текст успешно отправлен")
+	return nil
 }
+
+/* GIF_DISABLED_START
+   Чтобы вернуть гифки:
+   1. Раскомментируй этот блок
+   2. Верни imports: "bytes", "io", "math/rand", "mime/multipart"
+   3. Верни константы: RegularGifDir, MorningGifDir, EveningGifDir
+   4. Замени SendMessage обратно на: return bot.SendMessageWithAnimation(message, RegularGifDir)
+   5. Верни вызовы SendMessageWithAnimation в CheckAndSendDailyGreetings
+   6. Верни вызовы SendRandomAnimationToChat в SendScheduleToChat и SendMessageToChat
 
 func (bot *TimetableBot) SendMessageWithAnimation(message, animationDir string) error {
 	endpoint := fmt.Sprintf("%s%s/sendMessage", TelegramAPIURL, bot.botToken)
@@ -234,14 +267,13 @@ func (bot *TimetableBot) SendMessageWithAnimation(message, animationDir string) 
 		bodyBytes, _ := ioutil.ReadAll(resp.Body)
 		bodyString := string(bodyBytes)
 		logError("SendMessageWithAnimation: Telegram API вернул статус %d", resp.StatusCode)
-		fmt.Printf("📝 SendMessageWithAnimation response: %s\n", bodyString)
-		fmt.Printf("📤 SendMessageWithAnimation payload: %s\n", message)
-		fmt.Printf("🆔 SendMessageWithAnimation chat_id: %s\n", bot.userID)
+		fmt.Printf("SendMessageWithAnimation response: %s\n", bodyString)
+		fmt.Printf("SendMessageWithAnimation payload: %s\n", message)
+		fmt.Printf("SendMessageWithAnimation chat_id: %s\n", bot.userID)
 		return fmt.Errorf("telegram error: %d: %s", resp.StatusCode, bodyString)
 	}
 
 	logDebug("SendMessageWithAnimation: текст успешно отправлен")
-
 	return nil
 }
 
@@ -336,6 +368,7 @@ func randomAnimationPath(dir string) (string, error) {
 
 	return files[rand.Intn(len(files))], nil
 }
+GIF_DISABLED_END */
 
 // escapeHTML экранирует специальные HTML символы для Telegram API
 func escapeHTML(text string) string {
@@ -738,7 +771,8 @@ func (bot *TimetableBot) CheckAndSendDailyGreetings(now time.Time) {
 
 		message := bot.BuildMorningSummary(now)
 		logInfo("CheckAndSendDailyGreetings: отправляю доброе утро date=%s", date)
-		if err := bot.SendMessageWithAnimation(message, MorningGifDir); err != nil {
+		// GIF_DISABLED: if err := bot.SendMessageWithAnimation(message, MorningGifDir); err != nil {
+		if err := bot.SendMessage(message); err != nil {
 			logError("CheckAndSendDailyGreetings: ошибка утреннего сообщения date=%s: %v", date, err)
 			return
 		}
@@ -755,7 +789,8 @@ func (bot *TimetableBot) CheckAndSendDailyGreetings(now time.Time) {
 
 		message := bot.BuildEveningSummary(now)
 		logInfo("CheckAndSendDailyGreetings: отправляю вечерний summary date=%s", date)
-		if err := bot.SendMessageWithAnimation(message, EveningGifDir); err != nil {
+		// GIF_DISABLED: if err := bot.SendMessageWithAnimation(message, EveningGifDir); err != nil {
+		if err := bot.SendMessage(message); err != nil {
 			logError("CheckAndSendDailyGreetings: ошибка вечернего сообщения date=%s: %v", date, err)
 			return
 		}
@@ -825,6 +860,22 @@ func (bot *TimetableBot) Run() {
 	if err := bot.LoadSchedule("schedule.json"); err != nil {
 		logError("Run: не удалось загрузить расписание: %v", err)
 		return
+	}
+
+	// Уведомление о запуске
+	startMsg := fmt.Sprintf(
+		"🤖 <b>Бот запущен</b>\n\n"+
+			"✅ Расписание загружено: <b>%d пар</b>\n"+
+			"🔔 Уведомления за <b>%d мин</b> до пары\n"+
+			"📦 Версия: <code>%s</code>",
+		len(bot.schedule),
+		NotificationMinutes,
+		AppVersion,
+	)
+	if err := bot.SendMessage(startMsg); err != nil {
+		logError("Run: не удалось отправить стартовое сообщение: %v", err)
+	} else {
+		logInfo("Run: стартовое сообщение отправлено")
 	}
 
 	// Запускаем планировщик
@@ -1073,13 +1124,15 @@ func (bot *TimetableBot) SendScheduleToChat(chatID int64, commandMessageID int, 
 	}
 
 	messageIDs := []int{}
-	animationID, err := bot.SendRandomAnimationToChat(fmt.Sprintf("%d", chatID), RegularGifDir)
-	if err != nil {
-		logError("SendScheduleToChat: GIF не отправился, продолжаю отправку расписания chat_id=%d: %v", chatID, err)
-	}
-	if animationID != 0 {
-		messageIDs = append(messageIDs, animationID)
-	}
+	// GIF_DISABLED_START
+	// animationID, err := bot.SendRandomAnimationToChat(fmt.Sprintf("%d", chatID), RegularGifDir)
+	// if err != nil {
+	// 	logError("SendScheduleToChat: GIF не отправился, продолжаю отправку расписания chat_id=%d: %v", chatID, err)
+	// }
+	// if animationID != 0 {
+	// 	messageIDs = append(messageIDs, animationID)
+	// }
+	// GIF_DISABLED_END
 
 	messageID, err := bot.SendMessageToChatWithMarkup(chatID, message, markup)
 	if err != nil {
@@ -1184,9 +1237,11 @@ func (bot *TimetableBot) SendMessageToChat(chatID int64, message string) error {
 	endpoint := fmt.Sprintf("%s%s/sendMessage", TelegramAPIURL, bot.botToken)
 	logDebug("SendMessageToChat: chat_id=%d text_len=%d", chatID, len(message))
 
-	if _, err := bot.SendRandomAnimationToChat(fmt.Sprintf("%d", chatID), RegularGifDir); err != nil {
-		logError("SendMessageToChat: GIF не отправился, продолжаю отправку текста chat_id=%d: %v", chatID, err)
-	}
+	// GIF_DISABLED_START
+	// if _, err := bot.SendRandomAnimationToChat(fmt.Sprintf("%d", chatID), RegularGifDir); err != nil {
+	// 	logError("SendMessageToChat: GIF не отправился, продолжаю отправку текста chat_id=%d: %v", chatID, err)
+	// }
+	// GIF_DISABLED_END
 
 	data := url.Values{}
 	data.Set("chat_id", fmt.Sprintf("%d", chatID))
