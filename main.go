@@ -23,7 +23,7 @@ import (
 const (
 	CheckInterval  = 1 * time.Minute
 	TelegramAPIURL = "https://api.telegram.org/bot"
-	AppVersion     = "smart-summary-2026-04-29-2"
+	AppVersion     = "gif-system-2026-09-01"
 
 	// GIF_DISABLED: RegularGifDir = "assets/gif/regular"
 	// GIF_DISABLED: MorningGifDir = "assets/gif/gm"
@@ -51,6 +51,8 @@ type TimetableBot struct {
 	sentDailyGreetings        map[string]bool
 	lastScheduleMessages      map[int64][]int
 	lastUpdateID              int
+	gifData                   GifData
+	userStates                map[int64]*UserState
 }
 
 type Update struct {
@@ -60,9 +62,12 @@ type Update struct {
 }
 
 type Message struct {
-	MessageID int    `json:"message_id"`
-	Chat      Chat   `json:"chat"`
-	Text      string `json:"text"`
+	MessageID int        `json:"message_id"`
+	Chat      Chat       `json:"chat"`
+	Text      string     `json:"text"`
+	Animation *MediaFile `json:"animation,omitempty"`
+	Sticker   *MediaFile `json:"sticker,omitempty"`
+	Video     *MediaFile `json:"video,omitempty"`
 }
 
 type Chat struct {
@@ -154,6 +159,14 @@ func NewTimetableBot(token, userID string) *TimetableBot {
 		sentDailyGreetings:        make(map[string]bool),
 		lastScheduleMessages:      make(map[int64][]int),
 		lastUpdateID:              0,
+		gifData: GifData{
+			Gifs: make(map[string]GifEntry),
+			Settings: GifSettings{
+				MorningTime: "09:00",
+				EveningTime: "21:22",
+			},
+		},
+		userStates: make(map[int64]*UserState),
 	}
 }
 
@@ -705,6 +718,9 @@ func (bot *TimetableBot) CheckAndSendNotifications() {
 	upcoming := bot.GetUpcomingLessons()
 	logDebug("CheckAndSendNotifications: now=%s upcoming=%d sent=%d", now.Format(time.RFC3339), len(upcoming), len(bot.sentNotifications))
 
+	// Очищаем просроченные состояния пользователей
+	bot.CleanExpiredStates()
+
 	loc, _ := time.LoadLocation("Europe/Moscow")
 	nowInMoscow := now.In(loc)
 	bot.CheckAndSendDailyGreetings(nowInMoscow)
@@ -746,6 +762,10 @@ func (bot *TimetableBot) CheckAndSendNotifications() {
 		// Отправляем если осталось меньше 60 секунд
 		if timeDiff >= 0 && timeDiff <= 60 {
 			logInfo("CheckAndSendNotifications: sending lessonKey=%s timeDiff=%.1fs", lessonKey, timeDiff)
+
+			// Гифка перед уведомлением
+			bot.SendGifForSlot(bot.userID, SlotNotification)
+
 			message := bot.FormatNotification(&lesson)
 			err := bot.SendMessage(message)
 			if err == nil {
@@ -762,16 +782,22 @@ func (bot *TimetableBot) CheckAndSendNotifications() {
 func (bot *TimetableBot) CheckAndSendDailyGreetings(now time.Time) {
 	date := now.Format("02.01.2006")
 
-	if now.Hour() == 9 && now.Minute() == 0 {
+	morningH, morningM := ParseSettingsTime(bot.gifData.Settings.MorningTime)
+	eveningH, eveningM := ParseSettingsTime(bot.gifData.Settings.EveningTime)
+
+	if now.Hour() == morningH && now.Minute() == morningM {
 		key := "gm_" + date
 		if bot.sentDailyGreetings[key] {
 			logDebug("CheckAndSendDailyGreetings: morning already sent key=%s", key)
 			return
 		}
 
+		logInfo("CheckAndSendDailyGreetings: отправляю доброе утро date=%s time=%s", date, bot.gifData.Settings.MorningTime)
+
+		// Гифка перед утренним сообщением
+		bot.SendGifForSlot(bot.userID, SlotMorning)
+
 		message := bot.BuildMorningSummary(now)
-		logInfo("CheckAndSendDailyGreetings: отправляю доброе утро date=%s", date)
-		// GIF_DISABLED: if err := bot.SendMessageWithAnimation(message, MorningGifDir); err != nil {
 		if err := bot.SendMessage(message); err != nil {
 			logError("CheckAndSendDailyGreetings: ошибка утреннего сообщения date=%s: %v", date, err)
 			return
@@ -780,16 +806,19 @@ func (bot *TimetableBot) CheckAndSendDailyGreetings(now time.Time) {
 		return
 	}
 
-	if now.Hour() == 21 && now.Minute() == 22 {
+	if now.Hour() == eveningH && now.Minute() == eveningM {
 		key := "evening_" + date
 		if bot.sentDailyGreetings[key] {
 			logDebug("CheckAndSendDailyGreetings: evening already sent key=%s", key)
 			return
 		}
 
+		logInfo("CheckAndSendDailyGreetings: отправляю вечерний summary date=%s time=%s", date, bot.gifData.Settings.EveningTime)
+
+		// Гифка перед вечерним сообщением
+		bot.SendGifForSlot(bot.userID, SlotEvening)
+
 		message := bot.BuildEveningSummary(now)
-		logInfo("CheckAndSendDailyGreetings: отправляю вечерний summary date=%s", date)
-		// GIF_DISABLED: if err := bot.SendMessageWithAnimation(message, EveningGifDir); err != nil {
 		if err := bot.SendMessage(message); err != nil {
 			logError("CheckAndSendDailyGreetings: ошибка вечернего сообщения date=%s: %v", date, err)
 			return
@@ -862,14 +891,30 @@ func (bot *TimetableBot) Run() {
 		return
 	}
 
+	// Загружаем данные гифок
+	if err := bot.LoadGifData(); err != nil {
+		logError("Run: не удалось загрузить gif data: %v", err)
+		// Не фатально — продолжаем с пустыми гифками
+	}
+
 	// Уведомление о запуске
 	startMsg := fmt.Sprintf(
 		"🤖 <b>Бот запущен</b>\n\n"+
-			"✅ Расписание загружено: <b>%d пар</b>\n"+
-			"🔔 Уведомления за <b>%d мин</b> до пары\n"+
-			"📦 Версия: <code>%s</code>",
+			"✅ Расписание: <b>%d пар</b>\n"+
+			"🔔 Уведомления: за <b>%d мин</b> до пары\n"+
+			"🖼 Гифки: <b>%d шт</b>\n"+
+			"🌅 Утро: <b>%s</b> · 🌙 Вечер: <b>%s</b>\n"+
+			"📦 Версия: <code>%s</code>\n\n"+
+			"📋 <b>Команды:</b>\n"+
+			"/schedule — расписание на день\n"+
+			"/next — ближайшая пара\n"+
+			"/gifs — управление гифками\n"+
+			"/settings — настройки времени",
 		len(bot.schedule),
 		NotificationMinutes,
+		len(bot.gifData.Gifs),
+		bot.gifData.Settings.MorningTime,
+		bot.gifData.Settings.EveningTime,
 		AppVersion,
 	)
 	if err := bot.SendMessage(startMsg); err != nil {
@@ -936,42 +981,99 @@ func (bot *TimetableBot) HandleUpdate(update Update) {
 		return
 	}
 
+	msg := update.Message
+	chatID := msg.Chat.ID
+
 	// Логируем входящее сообщение
-	logInfo("HandleUpdate: message_id=%d chat_id=%d text=%q", update.Message.MessageID, update.Message.Chat.ID, update.Message.Text)
+	logInfo("HandleUpdate: message_id=%d chat_id=%d text=%q has_animation=%t has_sticker=%t has_video=%t",
+		msg.MessageID, chatID, msg.Text,
+		msg.Animation != nil, msg.Sticker != nil, msg.Video != nil)
 
-	if update.Message.Text == "/start" {
-		welcomeMsg := "👋 Привет! Я бот расписания МГУ ВШГА.\n\n" +
-			"Я буду присылать уведомления за 15 минут до начала пар.\n" +
-			"Остальные команды:\n" +
-			"/schedule - Посмотреть расписание\n" +
-			"/next - Ближайшая пара\n\n" +
-			"Твой ID: " + fmt.Sprintf("%d", update.Message.Chat.ID) + "\n" +
-			"(Убедись, что этот ID прописан в config.json)"
-
-		logInfo("HandleUpdate: отправляю /start ответ chat_id=%d", update.Message.Chat.ID)
-		bot.SendMessageToChat(update.Message.Chat.ID, welcomeMsg)
-	} else if update.Message.Text == "/schedule" {
-		loc, _ := time.LoadLocation("Europe/Moscow")
-		today := time.Now().In(loc)
-		logInfo("HandleUpdate: /schedule requested chat_id=%d today=%s", update.Message.Chat.ID, today.Format("02.01.2006"))
-		text, markup := bot.BuildScheduleMessageAndMarkup(today)
-
-		logDebug("HandleUpdate: /schedule response text_len=%d", len(text))
-		if err := bot.SendScheduleToChat(update.Message.Chat.ID, update.Message.MessageID, text, markup); err != nil {
-			logError("HandleUpdate: /schedule send failed chat_id=%d: %v", update.Message.Chat.ID, err)
+	// 1. Если пришло медиа и пользователь ждёт гифку — обрабатываем
+	if fileID, fileType := ExtractMediaInfo(msg); fileID != "" {
+		state := bot.GetUserState(chatID)
+		if state != nil && state.State == "waiting_media" {
+			bot.HandleMediaMessage(chatID, fileID, fileType)
+			return
 		}
-	} else if update.Message.Text == "/next" {
-		loc := moscowLocation()
-		now := time.Now().In(loc)
-		logInfo("HandleUpdate: /next requested chat_id=%d now=%s", update.Message.Chat.ID, now.Format(time.RFC3339))
-		text := bot.BuildNextLessonMessage(now)
-
-		if err := bot.SendMessageToChat(update.Message.Chat.ID, text); err != nil {
-			logError("HandleUpdate: /next send failed chat_id=%d: %v", update.Message.Chat.ID, err)
-		}
-	} else {
-		logDebug("HandleUpdate: message ignored text=%q", update.Message.Text)
+		// Медиа вне контекста добавления — игнорируем
 	}
+
+	// 2. Команды (начинаются с /). Отменяют любое активное состояние.
+	if strings.HasPrefix(msg.Text, "/") {
+		if bot.GetUserState(chatID) != nil {
+			bot.ClearUserState(chatID)
+		}
+
+		switch msg.Text {
+		case "/start":
+			welcomeMsg := "👋 <b>Привет!</b> Я бот расписания МГУ ВШГА.\n\n" +
+				"📋 <b>Что я умею:</b>\n" +
+				"🔔 Уведомления за " + fmt.Sprintf("%d", NotificationMinutes) + " мин до пары\n" +
+				"📚 /schedule — расписание на день\n" +
+				"⏭ /next — ближайшая пара\n" +
+				"🖼 /gifs — персональные гифки\n" +
+				"   <i>(добавляйте гифки, стикеры, видео)</i>\n" +
+				"⚙️ /settings — настройки времени\n" +
+				"   <i>(утренние и вечерние сообщения)</i>\n\n" +
+				"Твой ID: <code>" + fmt.Sprintf("%d", chatID) + "</code>\n" +
+				"<i>(Убедись, что этот ID прописан в config.json)</i>"
+
+			logInfo("HandleUpdate: отправляю /start ответ chat_id=%d", chatID)
+			bot.SendMessageToChat(chatID, welcomeMsg)
+
+		case "/schedule":
+			loc, _ := time.LoadLocation("Europe/Moscow")
+			today := time.Now().In(loc)
+			logInfo("HandleUpdate: /schedule requested chat_id=%d today=%s", chatID, today.Format("02.01.2006"))
+			text, markup := bot.BuildScheduleMessageAndMarkup(today)
+
+			logDebug("HandleUpdate: /schedule response text_len=%d", len(text))
+			if err := bot.SendScheduleToChat(chatID, msg.MessageID, text, markup); err != nil {
+				logError("HandleUpdate: /schedule send failed chat_id=%d: %v", chatID, err)
+			}
+
+		case "/next":
+			loc := moscowLocation()
+			now := time.Now().In(loc)
+			logInfo("HandleUpdate: /next requested chat_id=%d now=%s", chatID, now.Format(time.RFC3339))
+
+			// Гифка перед ответом
+			bot.SendGifForSlot(fmt.Sprintf("%d", chatID), SlotCommands)
+
+			text := bot.BuildNextLessonMessage(now)
+			if err := bot.SendMessageToChat(chatID, text); err != nil {
+				logError("HandleUpdate: /next send failed chat_id=%d: %v", chatID, err)
+			}
+
+		case "/gifs":
+			bot.HandleGifsCommand(chatID)
+
+		case "/settings":
+			bot.HandleSettingsCommand(chatID)
+
+		default:
+			logDebug("HandleUpdate: unknown command=%q", msg.Text)
+		}
+		return
+	}
+
+	// 3. Текстовое сообщение — проверяем state machine (ожидание имени гифки)
+	if msg.Text != "" {
+		if bot.HandleGifNameMessage(chatID, msg.Text) {
+			return
+		}
+	}
+
+	// 4. Если пользователь в состоянии waiting_media но прислал текст — подсказываем
+	state := bot.GetUserState(chatID)
+	if state != nil && state.State == "waiting_media" {
+		bot.SendMessageToChat(chatID, "📸 Отправьте гифку, стикер или короткое видео.\nИли нажмите ❌ Отмена.")
+		return
+	}
+
+	// 5. Остальные сообщения игнорируем
+	logDebug("HandleUpdate: message ignored text=%q", msg.Text)
 }
 
 func (bot *TimetableBot) HandleCallbackQuery(query *CallbackQuery) {
@@ -984,7 +1086,11 @@ func (bot *TimetableBot) HandleCallbackQuery(query *CallbackQuery) {
 	// Сразу отвечаем, чтобы убрать иконку загрузки
 	bot.AnswerCallbackQuery(query.ID)
 
-	if strings.HasPrefix(query.Data, "date:") {
+	if strings.HasPrefix(query.Data, "g:") {
+		bot.HandleGifCallback(query)
+	} else if strings.HasPrefix(query.Data, "s:") {
+		bot.HandleSettingsCallback(query)
+	} else if strings.HasPrefix(query.Data, "date:") {
 		dateStr := strings.TrimPrefix(query.Data, "date:")
 		loc, _ := time.LoadLocation("Europe/Moscow")
 		logDebug("HandleCallbackQuery: parsed date string=%s", dateStr)
@@ -1124,15 +1230,12 @@ func (bot *TimetableBot) SendScheduleToChat(chatID int64, commandMessageID int, 
 	}
 
 	messageIDs := []int{}
-	// GIF_DISABLED_START
-	// animationID, err := bot.SendRandomAnimationToChat(fmt.Sprintf("%d", chatID), RegularGifDir)
-	// if err != nil {
-	// 	logError("SendScheduleToChat: GIF не отправился, продолжаю отправку расписания chat_id=%d: %v", chatID, err)
-	// }
-	// if animationID != 0 {
-	// 	messageIDs = append(messageIDs, animationID)
-	// }
-	// GIF_DISABLED_END
+
+	// Отправляем гифку перед расписанием (слот "commands")
+	gifMsgID := bot.SendGifForSlot(fmt.Sprintf("%d", chatID), SlotCommands)
+	if gifMsgID != 0 {
+		messageIDs = append(messageIDs, gifMsgID)
+	}
 
 	messageID, err := bot.SendMessageToChatWithMarkup(chatID, message, markup)
 	if err != nil {
@@ -1236,12 +1339,6 @@ func (bot *TimetableBot) SendMessageToChatWithMarkup(chatID int64, message strin
 func (bot *TimetableBot) SendMessageToChat(chatID int64, message string) error {
 	endpoint := fmt.Sprintf("%s%s/sendMessage", TelegramAPIURL, bot.botToken)
 	logDebug("SendMessageToChat: chat_id=%d text_len=%d", chatID, len(message))
-
-	// GIF_DISABLED_START
-	// if _, err := bot.SendRandomAnimationToChat(fmt.Sprintf("%d", chatID), RegularGifDir); err != nil {
-	// 	logError("SendMessageToChat: GIF не отправился, продолжаю отправку текста chat_id=%d: %v", chatID, err)
-	// }
-	// GIF_DISABLED_END
 
 	data := url.Values{}
 	data.Set("chat_id", fmt.Sprintf("%d", chatID))

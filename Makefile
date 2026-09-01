@@ -22,7 +22,7 @@ build:
 # Сборка основного бота
 build-main:
 	@echo "Сборка бота..."
-	$(GO) build -o $(MAIN_BINARY) main.go parser.go
+	$(GO) build -o $(MAIN_BINARY) main.go parser.go gifs.go
 
 # Запуск парсера
 test:
@@ -54,8 +54,9 @@ deploy:
 		exit 1; \
 	fi
 	rsync -avz --exclude='.git' --exclude='logs' --exclude='venv' \
+		--exclude='config.json' --exclude='schedule.json' --exclude='gifs.json' \
 		. $(SERVER):~/msuparser/
-	ssh $(SERVER) 'cd ~/msuparser && make build build-main && sudo systemctl restart msuparser-bot'
+	ssh $(SERVER) 'cd ~/msuparser && go build -o main main.go parser.go gifs.go && sudo systemctl restart msuparser-bot'
 
 # Информация
 help:
