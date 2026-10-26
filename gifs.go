@@ -28,6 +28,27 @@ type GifEntry struct {
 type GifSettings struct {
 	MorningTime string `json:"morning_time"` // формат "HH:MM", default "09:00"
 	EveningTime string `json:"evening_time"` // формат "HH:MM", default "21:22"
+
+	// Утреннее напоминание о парах в 08:00. nil = значение по умолчанию
+	// (дистант — включено, как было раньше; очно — выключено).
+	RemindDistance *bool `json:"remind_distance,omitempty"`
+	RemindInPerson *bool `json:"remind_in_person,omitempty"`
+}
+
+// MorningReminderHour/Minute — время утреннего напоминания о парах
+const (
+	MorningReminderHour   = 8
+	MorningReminderMinute = 0
+)
+
+// RemindDistanceEnabled — напоминать в дни, когда все пары дистанционные
+func (s GifSettings) RemindDistanceEnabled() bool {
+	return s.RemindDistance == nil || *s.RemindDistance
+}
+
+// RemindInPersonEnabled — напоминать в обычные (очные) дни
+func (s GifSettings) RemindInPersonEnabled() bool {
+	return s.RemindInPerson != nil && *s.RemindInPerson
 }
 
 // GifData — всё хранилище гифок + настройки
@@ -54,8 +75,9 @@ type MediaFile struct {
 // Константы
 // ============================================================
 
+var GifDataFile = "gifs.json"
+
 const (
-	GifDataFile   = "gifs.json"
 	StateTimeout  = 5 * time.Minute
 	MaxGifNameLen = 15 // макс длина имени гифки в символах
 
@@ -333,9 +355,12 @@ func (bot *TimetableBot) sendSettingsMenu(chatID int64, editMessageID int) {
 		"⚙️ <b>Настройки</b>\n\n"+
 			"🌅 Утреннее сообщение: <b>%s</b>\n"+
 			"🌙 Вечернее сообщение: <b>%s</b>\n\n"+
-			"В указанное время придёт гифка и сводка расписания.",
+			"В указанное время придёт гифка и сводка расписания.\n\n"+
+			"⏰ Напоминание о парах в %02d:%02d: %s",
 		bot.gifData.Settings.MorningTime,
 		bot.gifData.Settings.EveningTime,
+		MorningReminderHour, MorningReminderMinute,
+		reminderStatusText(bot.gifData.Settings),
 	)
 
 	markup := InlineKeyboardMarkup{
@@ -343,6 +368,9 @@ func (bot *TimetableBot) sendSettingsMenu(chatID int64, editMessageID int) {
 			{
 				{Text: "🌅 Настроить утро", CallbackData: "s:mt"},
 				{Text: "🌙 Настроить вечер", CallbackData: "s:et"},
+			},
+			{
+				{Text: "⏰ Утреннее напоминание о парах", CallbackData: "s:rm"},
 			},
 			{
 				{Text: "🔄 Спарсить расписание", CallbackData: "s:parse"},
@@ -436,12 +464,84 @@ func (bot *TimetableBot) HandleSettingsCallback(query *CallbackQuery) {
 	case data == "s:parse":
 		bot.handleParseSchedule(chatID, messageID)
 
+	case data == "s:rm":
+		bot.sendReminderMenu(chatID, messageID)
+
+	case data == "s:rd":
+		on := !bot.gifData.Settings.RemindDistanceEnabled()
+		bot.gifData.Settings.RemindDistance = &on
+		bot.saveReminderSettings()
+		bot.sendReminderMenu(chatID, messageID)
+
+	case data == "s:ri":
+		on := !bot.gifData.Settings.RemindInPersonEnabled()
+		bot.gifData.Settings.RemindInPerson = &on
+		bot.saveReminderSettings()
+		bot.sendReminderMenu(chatID, messageID)
+
 	case strings.HasPrefix(data, "s:t:"):
 		rest := strings.TrimPrefix(data, "s:t:")
 		parts := strings.SplitN(rest, ":", 2)
 		if len(parts) == 2 {
 			bot.handleSettingsSetTime(chatID, messageID, parts[0], parts[1])
 		}
+	}
+}
+
+// ============================================================
+// /settings — утреннее напоминание о парах
+// ============================================================
+
+func (bot *TimetableBot) saveReminderSettings() {
+	if err := bot.SaveGifData(); err != nil {
+		logError("saveReminderSettings: ошибка сохранения: %v", err)
+	}
+}
+
+func checkbox(on bool) string {
+	if on {
+		return "✅"
+	}
+	return "⬜"
+}
+
+func reminderStatusText(s GifSettings) string {
+	d, p := s.RemindDistanceEnabled(), s.RemindInPersonEnabled()
+	switch {
+	case d && p:
+		return "<b>вкл</b> (дистант и очно)"
+	case d:
+		return "<b>вкл</b> (только дистант)"
+	case p:
+		return "<b>вкл</b> (только очно)"
+	}
+	return "<b>выкл</b>"
+}
+
+func (bot *TimetableBot) sendReminderMenu(chatID int64, messageID int) {
+	s := bot.gifData.Settings
+	text := fmt.Sprintf(
+		"⏰ <b>Утреннее напоминание о парах</b>\n\n"+
+			"Каждое утро в <b>%02d:%02d</b> бот присылает список всех пар на сегодня "+
+			"(номер, время, предмет, преподаватель).\n\n"+
+			"%s <b>Дистант</b> — в дни, когда все пары дистанционные\n"+
+			"%s <b>Очно</b> — в обычные дни, когда есть очные пары\n\n"+
+			"<i>Если не отмечено ничего, напоминание отключено. Если пар нет — сообщение не приходит.</i>",
+		MorningReminderHour, MorningReminderMinute,
+		checkbox(s.RemindDistanceEnabled()),
+		checkbox(s.RemindInPersonEnabled()),
+	)
+	markup := InlineKeyboardMarkup{
+		InlineKeyboard: [][]InlineKeyboardButton{
+			{{Text: checkbox(s.RemindDistanceEnabled()) + " Дистант", CallbackData: "s:rd"}},
+			{{Text: checkbox(s.RemindInPersonEnabled()) + " Очно", CallbackData: "s:ri"}},
+			{{Text: "◀️ Назад к настройкам", CallbackData: "s:m"}},
+		},
+	}
+	if messageID != 0 {
+		bot.EditMessageText(chatID, messageID, text, markup)
+	} else {
+		bot.SendMessageToChatWithMarkup(chatID, text, markup)
 	}
 }
 

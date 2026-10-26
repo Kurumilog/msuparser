@@ -101,11 +101,23 @@ func (p *ScheduleParser) getCSRFToken() (string, error) {
 	return "", fmt.Errorf("CSRF токен не найден")
 }
 
-// generateDateRange генерирует даты для запроса (текущая дата + 1 месяц)
+// ScheduleDays — на сколько дней вперёд загружаем расписание
+const ScheduleDays = 14
+
+// DefaultParserConfig возвращает конфигурацию парсера для группы 303
+func DefaultParserConfig() ParserConfig {
+	return ParserConfig{FacultyID: 3, Course: 3, GroupID: 52}
+}
+
+// generateDateRange генерирует даты для запроса (сегодня по Москве + ScheduleDays дней)
 func generateDateRange() (startDate, endDate string) {
-	now := time.Now()
+	loc, err := time.LoadLocation("Europe/Moscow")
+	if err != nil {
+		loc = time.Local
+	}
+	now := time.Now().In(loc)
 	start := now.Format("02.01.2006")
-	end := now.AddDate(0, 1, 0).Format("02.01.2006")
+	end := now.AddDate(0, 0, ScheduleDays).Format("02.01.2006")
 	return start, end
 }
 

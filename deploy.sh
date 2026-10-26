@@ -47,7 +47,7 @@ REMOTE_CHECK
 echo "==> Local checks"
 check_dir="$(mktemp -d)"
 trap 'rm -rf "${check_dir}"' EXIT
-GOCACHE="${GOCACHE:-${check_dir}/gocache}" go build -o "${check_dir}/main" main.go parser.go
+GOCACHE="${GOCACHE:-${check_dir}/gocache}" go build -o "${check_dir}/main" main.go parser.go gifs.go changes.go
 GOCACHE="${GOCACHE:-${check_dir}/gocache}" go build -o "${check_dir}/test_parser" test_parser.go parser.go
 
 echo "==> Preparing remote directory"
@@ -62,6 +62,9 @@ rsync -az \
   --exclude='config.json' \
   --exclude='config.py' \
   --exclude='schedule.json' \
+  --exclude='schedule_meta.json' \
+  --exclude='gifs.json' \
+  --exclude='*_test.go' \
   --exclude='main' \
   --exclude='test_parser' \
   ./ "${SERVER}:${REMOTE_DIR}/"
@@ -71,10 +74,10 @@ ssh "${SERVER}" "cd '${REMOTE_DIR}' && \
   ts=\$(date +%Y%m%d-%H%M%S) && \
   backup_dir='${REMOTE_DIR}/backups/deploy-'\$ts && \
   mkdir -p \"\$backup_dir\" && \
-  for f in main test_parser main.go parser.go test_parser.go config.json schedule.json; do \
+  for f in main test_parser main.go parser.go gifs.go changes.go test_parser.go config.json schedule.json schedule_meta.json gifs.json; do \
     if [ -e \"\$f\" ]; then cp -a \"\$f\" \"\$backup_dir/\"; fi; \
   done && \
-  go build -o main.new main.go parser.go && \
+  go build -o main.new main.go parser.go gifs.go changes.go && \
   go build -o test_parser.new test_parser.go parser.go && \
   install -m 755 main.new main && \
   install -m 755 test_parser.new test_parser && \

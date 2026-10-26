@@ -5,6 +5,10 @@ examples_test
 
 # Schedule cache
 schedule.json
+schedule_meta.json
+
+# GIF data
+gifs.json
 
 # Configuration
 config.json

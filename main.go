@@ -23,7 +23,7 @@ import (
 const (
 	CheckInterval  = 1 * time.Minute
 	TelegramAPIURL = "https://api.telegram.org/bot"
-	AppVersion     = "gif-system-2026-09-01"
+	AppVersion     = "schedule-watch-2026-10-26"
 
 	// GIF_DISABLED: RegularGifDir = "assets/gif/regular"
 	// GIF_DISABLED: MorningGifDir = "assets/gif/gm"
@@ -52,7 +52,10 @@ type TimetableBot struct {
 	lastScheduleMessages      map[int64][]int
 	lastUpdateID              int
 	gifData                   GifData
-	userStates                map[int64]*UserState
+	userStates                      map[int64]*UserState
+	sendMessageFunc                 func(message string) error
+	sendMessageToChatWithMarkupFunc func(chatID int64, message string, markup InlineKeyboardMarkup) (int, error)
+	editMessageTextFunc             func(chatID int64, messageID int, text string, markup InlineKeyboardMarkup) error
 }
 
 type Update struct {
@@ -196,30 +199,10 @@ func (bot *TimetableBot) LoadSchedule(filename string) error {
 	return nil
 }
 
-func (bot *TimetableBot) UpdateSchedule() {
-	logInfo("UpdateSchedule: запускаю ./test_parser из %s", mustGetwd())
-	// Запускаем парсер для обновления расписания
-	cmd := exec.Command("./test_parser")
-	cmd.Dir = "."
-
-	output, err := cmd.CombinedOutput()
-	if err != nil {
-		logError("UpdateSchedule: ошибка запуска парсера: %v", err)
-		fmt.Printf("📝 UpdateSchedule output:\n%s\n", string(output))
-		return
-	}
-	logInfo("UpdateSchedule: parser completed successfully, output=%d bytes", len(output))
-
-	// Перезагружаем расписание из обновленного файла
-	err = bot.LoadSchedule("schedule.json")
-	if err != nil {
-		logError("UpdateSchedule: ошибка перезагрузки расписания: %v", err)
-		return
-	}
-	logInfo("UpdateSchedule: расписание перезагружено успешно")
-}
-
 func (bot *TimetableBot) SendMessage(message string) error {
+	if bot.sendMessageFunc != nil {
+		return bot.sendMessageFunc(message)
+	}
 	// GIF_DISABLED: was return bot.SendMessageWithAnimation(message, RegularGifDir)
 	endpoint := fmt.Sprintf("%s%s/sendMessage", TelegramAPIURL, bot.botToken)
 	logDebug("SendMessage: method=sendMessage chat_id=%s len(text)=%d", bot.userID, len(message))
@@ -647,19 +630,32 @@ func isDistanceLearning(room string) bool {
 	return strings.Contains(room, "дистанц") || strings.Contains(room, "виртуал")
 }
 
-// SendDistanceLearningNotification отправляет уведомление о дистанционных парах за день
-func (bot *TimetableBot) SendDistanceLearningNotification(date string, lessons []Lesson) {
-	logInfo("SendDistanceLearningNotification: date=%s lessons=%d already_sent=%t", date, len(lessons), bot.sentDistanceNotifications[date])
+// SendMorningReminder отправляет утреннее напоминание со всеми парами на день
+func (bot *TimetableBot) SendMorningReminder(date string, lessons []Lesson, distanceDay bool) {
+	logInfo("SendMorningReminder: date=%s lessons=%d distance_day=%t already_sent=%t", date, len(lessons), distanceDay, bot.sentDistanceNotifications[date])
 	if bot.sentDistanceNotifications[date] {
-		logDebug("SendDistanceLearningNotification: пропуск, уже отправляли на %s", date)
+		logDebug("SendMorningReminder: пропуск, уже отправляли на %s", date)
 		return
 	}
 
-	message := fmt.Sprintf(
-		"📱 <b>Утреннее напоминание</b>\n\n" +
-			"У вас сегодня дистанционные пары:\n\n",
-	)
+	hasDistance, hasInPerson := false, false
+	for _, l := range lessons {
+		if isDistanceLearning(l.Room) {
+			hasDistance = true
+		} else {
+			hasInPerson = true
+		}
+	}
 
+	header := "У вас сегодня очные пары:"
+	switch {
+	case distanceDay:
+		header = "У вас сегодня дистанционные пары:"
+	case hasDistance && hasInPerson:
+		header = "У вас сегодня пары (есть и дистанционные):"
+	}
+
+	message := "📱 <b>Утреннее напоминание</b>\n\n" + header + "\n\n"
 	for _, lesson := range lessons {
 		message += fmt.Sprintf(
 			"• %s пара (%s-%s)\n  📚 %s\n",
@@ -671,46 +667,56 @@ func (bot *TimetableBot) SendDistanceLearningNotification(date string, lessons [
 		if lesson.Teacher != "" {
 			message += fmt.Sprintf("  👨‍🏫 %s\n", escapeHTML(lesson.Teacher))
 		}
-	}
-
-	err := bot.SendMessage(message)
-	if err == nil {
-		logInfo("SendDistanceLearningNotification: отправлено на %s", date)
-		bot.sentDistanceNotifications[date] = true
-	} else {
-		logError("SendDistanceLearningNotification: ошибка отправки на %s: %v", date, err)
-	}
-}
-
-// GetTodayDistanceLessons возвращает все дистанционные пары на сегодня
-func (bot *TimetableBot) GetTodayDistanceLessons() map[string][]Lesson {
-	loc, _ := time.LoadLocation("Europe/Moscow")
-	now := time.Now().In(loc)
-	today := now.Format("02.01.2006")
-
-	distanceLessons := make(map[string][]Lesson)
-
-	for _, lesson := range bot.schedule {
-		if lesson.Date == today && isDistanceLearning(lesson.Room) {
-			distanceLessons[lesson.Date] = append(distanceLessons[lesson.Date], lesson)
+		if !distanceDay && strings.TrimSpace(lesson.Room) != "" {
+			message += fmt.Sprintf("  🚪 %s\n", escapeHTML(lesson.Room))
 		}
 	}
 
-	return distanceLessons
+	if err := bot.SendMessage(message); err == nil {
+		logInfo("SendMorningReminder: отправлено на %s", date)
+		bot.sentDistanceNotifications[date] = true
+	} else {
+		logError("SendMorningReminder: ошибка отправки на %s: %v", date, err)
+	}
+}
+
+// CheckAndSendMorningReminder решает, нужно ли утреннее напоминание (вызывается в 08:00 МСК)
+func (bot *TimetableBot) CheckAndSendMorningReminder(now time.Time) {
+	today := now.Format("02.01.2006")
+	lessons := bot.GetLessonsForDate(today)
+	if len(lessons) == 0 {
+		logDebug("CheckAndSendMorningReminder: сегодня пар нет")
+		return
+	}
+
+	distanceDay := !bot.HasInPersonLessonsForDate(today)
+	settings := bot.gifData.Settings
+	if distanceDay && !settings.RemindDistanceEnabled() {
+		logDebug("CheckAndSendMorningReminder: дистант-день, напоминание выключено в настройках")
+		return
+	}
+	if !distanceDay && !settings.RemindInPersonEnabled() {
+		logDebug("CheckAndSendMorningReminder: очный день, напоминание выключено в настройках")
+		return
+	}
+	bot.SendMorningReminder(today, lessons, distanceDay)
+}
+
+// HasInPersonLessonsForDate проверяет есть ли очные пары в указанную дату
+func (bot *TimetableBot) HasInPersonLessonsForDate(date string) bool {
+	for _, lesson := range bot.schedule {
+		if lesson.Date == date && !isDistanceLearning(lesson.Room) {
+			return true
+		}
+	}
+	return false
 }
 
 // HasInPersonLessonsToday проверяет есть ли очные пары сегодня
 func (bot *TimetableBot) HasInPersonLessonsToday() bool {
 	loc, _ := time.LoadLocation("Europe/Moscow")
-	now := time.Now().In(loc)
-	today := now.Format("02.01.2006")
-
-	for _, lesson := range bot.schedule {
-		if lesson.Date == today && !isDistanceLearning(lesson.Room) {
-			return true
-		}
-	}
-	return false
+	today := time.Now().In(loc).Format("02.01.2006")
+	return bot.HasInPersonLessonsForDate(today)
 }
 
 func (bot *TimetableBot) CheckAndSendNotifications() {
@@ -725,19 +731,10 @@ func (bot *TimetableBot) CheckAndSendNotifications() {
 	nowInMoscow := now.In(loc)
 	bot.CheckAndSendDailyGreetings(nowInMoscow)
 
-	// Проверяем: если ВСЕ пары дистанционные (нет очных) - отправляем утреннее уведомление в 8:00
-	if nowInMoscow.Hour() == 8 && nowInMoscow.Minute() == 0 {
-		logInfo("CheckAndSendNotifications: наступило 08:00 Moscow")
-		// Отправляем утреннее уведомление только если нет очных пар
-		if !bot.HasInPersonLessonsToday() {
-			logInfo("CheckAndSendNotifications: сегодня нет очных пар, проверяю дистанционные")
-			distanceLessons := bot.GetTodayDistanceLessons()
-			for date, lessons := range distanceLessons {
-				bot.SendDistanceLearningNotification(date, lessons)
-			}
-		} else {
-			logDebug("CheckAndSendNotifications: есть очные пары, утреннее дистанционное уведомление не нужно")
-		}
+	// Утреннее напоминание о парах (настраивается в /settings)
+	if nowInMoscow.Hour() == MorningReminderHour && nowInMoscow.Minute() == MorningReminderMinute {
+		logInfo("CheckAndSendNotifications: время утреннего напоминания")
+		bot.CheckAndSendMorningReminder(nowInMoscow)
 	}
 
 	// Отправляем обычные уведомления за 30 минут
@@ -853,26 +850,22 @@ func (bot *TimetableBot) RunScheduler() {
 		}
 	}()
 
-	// Переменная для отслеживания последнего запуска парсера
-	lastParserRun := time.Now().Add(-25 * time.Hour) // Инициализируем в прошлом
+	// Время последней проверки расписания (нулевое — значит проверить сразу после старта)
+	var lastRefresh time.Time
 
 	for {
 		select {
 		case <-ticker.C:
 			logDebug("RunScheduler: minute tick")
-			// Проверяем нужно ли запустить парсер (каждый день в 2:00)
-			loc, _ := time.LoadLocation("Europe/Moscow")
-			nowMoscow := time.Now().In(loc)
+			nowMoscow := time.Now().In(moscowLocation())
 			logDebug("RunScheduler: Moscow time=%s", nowMoscow.Format(time.RFC3339))
 
-			// Если сейчас 2:00 и парсер не запускался сегодня
-			if nowMoscow.Hour() == 2 && nowMoscow.Minute() == 0 {
-				if time.Since(lastParserRun) > 23*time.Hour {
-					logInfo("RunScheduler: запускаю обновление расписания по расписанию")
-					bot.UpdateSchedule()
-					lastParserRun = time.Now()
-					logInfo("RunScheduler: расписание обновлено")
-				}
+			// Постоянная индексация: днём раз в 15 минут, ночью раз в час.
+			// Выполняется в отдельной горутине, чтобы не задерживать уведомления.
+			if shouldRefreshSchedule(nowMoscow, lastRefresh) {
+				lastRefresh = time.Now()
+				logInfo("RunScheduler: проверяю расписание на изменения")
+				go bot.UpdateSchedule()
 			}
 
 			bot.CheckAndSendNotifications()
@@ -1189,6 +1182,9 @@ func (bot *TimetableBot) BuildScheduleMessageAndMarkup(date time.Time) (string, 
 }
 
 func (bot *TimetableBot) EditMessageText(chatID int64, messageID int, text string, markup InlineKeyboardMarkup) error {
+	if bot.editMessageTextFunc != nil {
+		return bot.editMessageTextFunc(chatID, messageID, text, markup)
+	}
 	endpoint := fmt.Sprintf("%s%s/editMessageText", TelegramAPIURL, bot.botToken)
 	logDebug("EditMessageText: chat_id=%d message_id=%d text_len=%d", chatID, messageID, len(text))
 
@@ -1296,6 +1292,9 @@ func (bot *TimetableBot) DeleteMessage(chatID int64, messageID int) error {
 }
 
 func (bot *TimetableBot) SendMessageToChatWithMarkup(chatID int64, message string, markup InlineKeyboardMarkup) (int, error) {
+	if bot.sendMessageToChatWithMarkupFunc != nil {
+		return bot.sendMessageToChatWithMarkupFunc(chatID, message, markup)
+	}
 	endpoint := fmt.Sprintf("%s%s/sendMessage", TelegramAPIURL, bot.botToken)
 	logDebug("SendMessageToChatWithMarkup: chat_id=%d text_len=%d", chatID, len(message))
 

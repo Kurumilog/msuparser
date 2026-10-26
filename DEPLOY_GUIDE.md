@@ -1,396 +1,262 @@
-# Установка MSU Timetable Bot на Ubuntu Server
+# Руководство по развертыванию MSU Timetable Bot
 
-Полное руководство по развертыванию бота расписания МГУ на удаленном сервере Ubuntu.
+Полное руководство по установке, обновлению и поддержке Telegram-бота расписания МГУ ВШГА на удаленном сервере (Ubuntu/Debian).
+
+---
 
 ## Требования
 
-- Ubuntu 20.04+ (или Debian 11+)
-- Go 1.24+
-- Доступ по SSH с правами sudo
-- Telegram бот токен
+- Ubuntu 20.04+ или Debian 11+
+- Go 1.21+ (рекомендуется 1.24+)
+- Доступ по SSH к серверу
+- Telegram бот токен от [@BotFather](https://t.me/BotFather)
+- Ваш Telegram ID от [@userinfobot](https://t.me/userinfobot)
 
-## Быстрая установка (5 минут)
+---
+
+## Быстрая установка
 
 ### 1. Подключение к серверу
 
 ```bash
-ssh ubuntu@your-server-ip
+ssh root@your-server-ip
 ```
 
-### 2. Установка Go
+### 2. Установка Go (если еще не установлен)
 
 ```bash
-# Скачиваем последнюю версию Go
+# Скачиваем стабильную версию Go
 wget https://go.dev/dl/go1.24.0.linux-amd64.tar.gz
 
-# Удаляем старую версию (если есть)
-sudo rm -rf /usr/local/go
+# Удаляем старую версию и распаковываем
+rm -rf /usr/local/go
+tar -C /usr/local -xzf go1.24.0.linux-amd64.tar.gz
+rm go1.24.0.linux-amd64.tar.gz
 
-# Распаковываем
-sudo tar -C /usr/local -xzf go1.24.0.linux-amd64.tar.gz
-
-# Добавляем в PATH
+# Добавляем в PATH (если отсутствует)
 echo 'export PATH=$PATH:/usr/local/go/bin' >> ~/.bashrc
 source ~/.bashrc
 
-# Проверяем установку
+# Проверяем
 go version
 ```
 
-### 3. Клонирование проекта
+### 3. Подготовка каталога проекта
 
 ```bash
-cd ~
-git clone https://github.com/Kurumilog/msuparser.git
-cd msuparser
+mkdir -p /root/msuparser
+cd /root/msuparser
 ```
 
-### 4. Настройка конфигурации
+### 4. Настройка конфигурации (`config.json`)
+
+Создайте файл `config.json`:
+
+```json
+{
+  "BOT_TOKEN": "ваш-токен-от-BotFather",
+  "USER_ID": "ваш-числовой-telegram-id",
+  "NOTIFICATION_MINUTES": 15
+}
+```
+
+Ограничьте права доступа:
+```bash
+chmod 600 config.json
+```
+
+---
+
+## Перенос файлов на сервер
+
+Поскольку на сервере репозиторий развернут без `.git`, файлы отправляются с локальной машины через `scp` или `rsync`:
+
+### С локального компьютера:
 
 ```bash
-# Копируем пример конфига
-cp config.example.py config.py
+cd /Users/kurumi/code/msuparser
 
-# Редактируем конфиг
-nano config.py
+# Отправка исходного кода (конфиги и локальные json исключены)
+scp main.go gifs.go parser.go changes.go test_parser.go Makefile deploy.sh root@5.253.188.95:/root/msuparser/
 ```
 
-Заполните:
-```python
-BOT_TOKEN = "your-telegram-bot-token"
-USER_ID = "your-telegram-user-id"
-NOTIFICATION_MINUTES = 15
-```
+---
 
-**Как узнать USER_ID:**
-1. Напишите боту [@userinfobot](https://t.me/userinfobot)
-2. Скопируйте ваш ID
+## Сборка и запуск на сервере
 
-### 5. Сборка приложения
+### 1. Установка зависимостей и сборка
 
 ```bash
-# Устанавливаем зависимости
+cd /root/msuparser
+
+# Зависимости
 go get github.com/PuerkitoBio/goquery
 go mod tidy
 
-# Собираем парсер
+# Сборка парсера и бота
 go build -o test_parser test_parser.go parser.go
-
-# Собираем бота
-go build -o main main.go parser.go
+go build -o main main.go parser.go gifs.go changes.go
 ```
 
-### 6. Тестирование
+### 2. Проверка работы парсера
 
 ```bash
-# Проверяем парсер
 ./test_parser
-
-# Должно появиться:
-# ✅ Найдено занятий: XX
-# 💾 Расписание сохранено в schedule.json
 ```
 
-### 7. Установка сервисов
-
-```bash
-# Копируем файлы сервисов
-sudo cp msuparser-bot.service /etc/systemd/system/
-sudo cp msuparser-update.service /etc/systemd/system/
-sudo cp msuparser-update.timer /etc/systemd/system/
-
-# Редактируем пути в сервисах (если нужно)
-sudo nano /etc/systemd/system/msuparser-bot.service
-sudo nano /etc/systemd/system/msuparser-update.service
-
-# Перезагружаем systemd
-sudo systemctl daemon-reload
+Успешный вывод:
+```
+📚 Получение расписания с tt.audit.msu.ru...
+✅ Найдено занятий: XX
+💾 Расписание сохранено в schedule.json
 ```
 
-### 8. Запуск сервисов
+### 3. Настройка systemd-сервиса бота
 
-```bash
-# Включаем автозапуск
-sudo systemctl enable msuparser-bot.service
-sudo systemctl enable msuparser-update.timer
+Создайте или отредактируйте unit-файл `/etc/systemd/system/msuparser-bot.service`:
 
-# Запускаем бота
-sudo systemctl start msuparser-bot.service
-
-# Запускаем таймер обновления расписания (раз в 3 дня)
-sudo systemctl start msuparser-update.timer
-
-# Проверяем статус
-sudo systemctl status msuparser-bot.service
-sudo systemctl status msuparser-update.timer
-```
-
-## Управление сервисами
-
-### Проверка статуса
-
-```bash
-# Статус бота
-sudo systemctl status msuparser-bot
-
-# Логи бота
-sudo journalctl -u msuparser-bot -f
-
-# Логи парсера
-sudo journalctl -u msuparser-update -f
-```
-
-### Перезапуск
-
-```bash
-# Перезапуск бота
-sudo systemctl restart msuparser-bot
-
-# Ручной запуск парсера
-sudo systemctl start msuparser-update
-```
-
-### Остановка
-
-```bash
-# Остановка бота
-sudo systemctl stop msuparser-bot
-
-# Остановка таймера обновления
-sudo systemctl stop msuparser-update.timer
-```
-
-### Просмотр логов
-
-```bash
-# Последние 100 строк логов бота
-sudo journalctl -u msuparser-bot -n 100
-
-# Логи за сегодня
-sudo journalctl -u msuparser-bot --since today
-
-# Следить за логами в реальном времени
-sudo journalctl -u msuparser-bot -f
-```
-
-## Обновление
-
-```bash
-cd ~/msuparser
-
-# Получаем последние изменения
-git pull
-
-# Пересобираем
-go build -o test_parser test_parser.go parser.go
-go build -o main main.go parser.go
-
-# Перезапускаем
-sudo systemctl restart msuparser-bot
-```
-
-## Расписание обновлений
-
-По умолчанию парсер запускается раз в 3 дня в 03:00.
-
-Изменить расписание можно в файле `msuparser-update.timer`:
-
-```bash
-sudo nano /etc/systemd/system/msuparser-update.timer
-```
-
-```ini
-[Timer]
-OnCalendar=*-*-* 03:00:00  # Каждый день в 3:00
-# OnCalendar=Mon,Thu 03:00:00  # Пн и Чт в 3:00
-# OnCalendar=daily  # Каждый день
-```
-
-После изменения:
-```bash
-sudo systemctl daemon-reload
-sudo systemctl restart msuparser-update.timer
-```
-
-## Структура проекта
-
-```
-msuparser/
-├── main.go                      # Telegram бот
-├── parser.go                    # Парсер расписания
-├── test_parser.go               # Тестовый запуск парсера
-├── config.py                    # Конфигурация (BOT_TOKEN, USER_ID)
-├── schedule.json                # Кэш расписания
-├── msuparser-bot.service        # Systemd сервис бота
-├── msuparser-update.service     # Systemd сервис обновления
-└── msuparser-update.timer       # Таймер обновления расписания
-```
-
-## Особенности работы
-
-### Уведомления
-
-- **Обычные пары**: Уведомление за 15 минут до начала
-- **Дистанционные пары**: Одно уведомление утром в 8:00 со списком всех дистанционных пар на день
-- **3 пара**: Уведомление за 45 минут (т.к. после обеда)
-
-### Дистанционные пары
-
-Бот автоматически определяет дистанционные пары по ключевым словам в названии аудитории:
-- `дистанц`
-- `виртуал`
-
-Вместо отправки отдельного уведомления перед каждой дистанционной парой, бот отправляет одно сообщение утром:
-
-```
-📱 Напоминание
-
-У вас сегодня дистанционные пары:
-
-• 1 пара (09:00-10:30)
-  📚 Международное право [Сем]
-  👨‍🏫 Пименова Софья Дмитриевна
-  
-• 2 пара (10:45-12:15)
-  📚 Земельное право [Лк]
-  👨‍🏫 Старова Екатерина Владимировна
-```
-
-## Мониторинг
-
-### Проверка работоспособности
-
-```bash
-# Проверяем, работает ли бот
-sudo systemctl is-active msuparser-bot
-
-# Проверяем, включен ли автозапуск
-sudo systemctl is-enabled msuparser-bot
-
-# Проверяем таймер обновления
-sudo systemctl list-timers | grep msuparser
-```
-
-### Настройка алертов
-
-Можно настроить уведомления при падении сервиса через systemd:
-
-```bash
-sudo nano /etc/systemd/system/msuparser-bot.service
-```
-
-Добавить:
 ```ini
 [Unit]
-OnFailure=status-email@%n.service
-```
+Description=MSU Timetable Bot (Go)
+After=network.target
 
-## Резервное копирование
-
-```bash
-# Создаем резервную копию конфигурации
-cp ~/msuparser/config.py ~/msuparser-config-backup.py
-
-# Создаем резервную копию schedule.json
-cp ~/msuparser/schedule.json ~/msuparser-schedule-backup.json
-```
-
-## Безопасность
-
-### Ограничение доступа к config.py
-
-```bash
-chmod 600 ~/msuparser/config.py
-```
-
-### Использование переменных окружения (опционально)
-
-Вместо `config.py` можно использовать переменные окружения:
-
-```bash
-sudo nano /etc/systemd/system/msuparser-bot.service
-```
-
-Добавить:
-```ini
 [Service]
-Environment="BOT_TOKEN=your-token"
-Environment="USER_ID=your-id"
+Type=simple
+User=root
+WorkingDirectory=/root/msuparser
+ExecStart=/root/msuparser/main
+Restart=always
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=msuparser-bot
+
+[Install]
+WantedBy=multi-user.target
 ```
 
-## Troubleshooting
+### 4. Отключение устаревшего таймера обновления
+
+> **Важно**: Бот теперь выполняет **постоянную фоновую индексацию сам** (каждые 15 минут днем и каждый час ночью), сравнивает изменения с прошлым снимком и присылает детальные push-уведомления. Внешний systemd-таймер обновления больше не нужен и должен быть отключен, чтобы не перезаписывать `schedule.json` в обход механизма сравнения.
+
+```bash
+systemctl disable --now msuparser-update.timer 2>/dev/null || true
+```
+
+### 5. Запуск бота
+
+```bash
+systemctl daemon-reload
+systemctl enable msuparser-bot
+systemctl restart msuparser-bot
+```
+
+### 6. Проверка статуса и логов
+
+```bash
+systemctl is-active msuparser-bot
+journalctl -u msuparser-bot -f
+```
+
+---
+
+## Как устроена работа бота
+
+### 1. Постоянная индексация и оповещения об изменениях
+- **Интервал**: каждые 15 минут в дневное время (07:00–23:00 МСК) и раз в час ночью.
+- **Окно отслеживания**: парсинг ведется на 14 дней вперед, push-уведомления об изменениях высылаются для событий ближайших 7 дней.
+- **Типы изменений**:
+  - `🟥 + Добавлена пара`
+  - `🟩 − Отменена пара`
+  - `🔄 Перенос пары` (как внутри дня, так и с другого дня)
+  - `🟥 Замена предмета` в том же временном слоте
+  - `🔄 Изменение аудитории или смена преподавателя`
+- **Оформление**: моноширинное выравнивание времени (`1 пара 09:00–10:30`), аудитория курсивом, преподаватель отдельной строкой.
+- **Защита от сбоев**: если сайт временно вернул пустую страницу, бот не считает это отменой занятий вплоть до 4 сбоев подряд. Снимок хранится в `schedule.json` и `schedule_meta.json`.
+
+### 2. Обычные уведомления перед занятиями
+- За 15 минут до начала каждой пары (для 3-й пары — за 45 минут).
+
+### 3. Утреннее напоминание в 08:00
+- Отправляет итоговый список всех пар на день (время, предмет, аудитория, преподаватель).
+- Настраивается прямо в боте через команду `/settings` → **«Утреннее напоминание о парах»**:
+  - `✅ Дистант` — включить в дни, когда все пары дистанционные.
+  - `✅ Очно` — включить в обычные учебные дни с очными занятиями.
+
+### 4. Персональные медиа (гифки, стикеры, видео)
+- Команда `/gifs` позволяет загружать медиа и привязывать их к слотам: `🌅 Утро`, `🌙 Вечер`, `🔔 Уведомления`, `📱 Команды`.
+- Данные медиа и персональные настройки хранятся в `gifs.json` и **никогда не перезаписываются при деплое**.
+
+---
+
+## Обновление бота на сервере
+
+Безопасное обновление без потери настроек и расписания:
+
+```bash
+cd /root/msuparser
+
+# 1. Создаем резервную копию
+mkdir -p backups/deploy-$(date +%Y%m%d-%H%M%S)
+cp -a main main.go parser.go gifs.go changes.go config.json schedule.json schedule_meta.json gifs.json backups/deploy-*/ 2>/dev/null || true
+
+# 2. Компилируем во временный бинарник
+go build -o main.new main.go parser.go gifs.go changes.go
+
+# 3. Атомарно заменяем бинарник и перезапускаем
+install -m 755 main.new main && rm -f main.new
+systemctl restart msuparser-bot
+
+# 4. Проверяем логи
+sleep 2
+systemctl is-active msuparser-bot
+journalctl -u msuparser-bot -n 25 --no-pager
+```
+
+---
+
+## Файловая структура на сервере
+
+```
+/root/msuparser/
+├── main                    # Скомпилированный бинарник бота
+├── test_parser             # Вспомогательный CLI парсер
+├── main.go                 # Основной цикл бота, планировщик и команды
+├── parser.go               # HTTP парсер tt.audit.msu.ru (14 дней)
+├── gifs.go                 # Управление гифками и меню /settings
+├── changes.go              # Индексация, дифф и push-уведомления
+├── config.json             # Токен бота и ID пользователя (не перезаписывать!)
+├── schedule.json           # Актуальный кэш расписания
+├── schedule_meta.json      # Метаданные диапазона последнего снимка
+├── gifs.json               # Пользовательские гифки и настройки времени
+├── Makefile                # Скрипты локальной сборки
+├── deploy.sh               # Скрипт автоматизированного развертывания
+└── backups/                # Автоматические резервные копии
+```
+
+---
+
+## Диагностика и решение проблем
 
 ### Бот не запускается
-
 ```bash
-# Проверяем логи
-sudo journalctl -u msuparser-bot -n 50
-
-# Проверяем конфиг
-cat ~/msuparser/config.py
-
-# Проверяем schedule.json
-ls -lh ~/msuparser/schedule.json
+journalctl -u msuparser-bot -n 50 --no-pager
 ```
+- Проверьте валидность `config.json`: `jq . config.json`
+- Проверьте права на исполняемый файл: `ls -la main`
 
-### Парсер не работает
-
+### Проверка часового пояса
+Время на сервере должно быть синхронизировано по Москве:
 ```bash
-# Запускаем вручную
-cd ~/msuparser
-./test_parser
-
-# Проверяем права доступа
-ls -lh test_parser
-chmod +x test_parser
+timedatectl
+# Если часовой пояс отличается:
+timedatectl set-timezone Europe/Moscow
 ```
 
-### Уведомления не приходят
-
-1. Проверьте BOT_TOKEN и USER_ID в config.py
-2. Убедитесь, что вы написали боту `/start`
-3. Проверьте часовой пояс: `timedatectl`
-
-### Изменение часового пояса
-
+### Откат к предыдущей версии
+В случае любых проблем восстановите предыдущее состояние из папки бэкапов:
 ```bash
-sudo timedatectl set-timezone Europe/Minsk
+cd /root/msuparser
+cp -a backups/pre-deploy/* .
+systemctl restart msuparser-bot
 ```
-
-## Настройка автоматических обновлений
-
-```bash
-# Создаем скрипт обновления
-nano ~/update-msuparser.sh
-```
-
-```bash
-#!/bin/bash
-cd ~/msuparser
-git pull
-go build -o test_parser test_parser.go parser.go
-go build -o main main.go parser.go
-sudo systemctl restart msuparser-bot
-```
-
-```bash
-# Делаем исполняемым
-chmod +x ~/update-msuparser.sh
-
-# Добавляем в cron (каждое воскресенье в 4:00)
-crontab -e
-```
-
-Добавить:
-```
-0 4 * * 0 /home/ubuntu/update-msuparser.sh >> /home/ubuntu/msuparser-update.log 2>&1
-```
-
-## Контакты и поддержка
-
-- GitHub: https://github.com/Kurumilog/msuparser
-- Issues: https://github.com/Kurumilog/msuparser/issues
-
-## Лицензия
-
-См. LICENSE файл в репозитории.
